@@ -190,3 +190,42 @@ fn normalize_triggers(on_value: &serde_yaml::Value) -> Result<Vec<String>, Strin
 
     Ok(triggers)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_workflow;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_workflow_allows_null_workflow_dispatch_with_other_triggers() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: trigger-test
+on:
+  push:
+    branches: []
+    tags-ignore: []
+  release:
+    types: [prereleased, published]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path);
+        assert!(
+            parsed.is_ok(),
+            "Expected workflow to parse successfully, got: {:?}",
+            parsed.err()
+        );
+    }
+}
