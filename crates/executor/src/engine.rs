@@ -635,17 +635,24 @@ async fn prepare_action(
 ///
 /// For branch/tag refs, uses `git clone --depth 1 --branch <ref>`.
 /// For SHA refs (40 hex chars), uses `git init` + `git fetch --depth 1` + `git checkout`.
-fn shallow_clone(repo_url: &str, git_ref: &str, target_dir: &Path) -> Result<(), ExecutionError> {
+///
+/// Uses `tokio::process::Command` to avoid blocking the async runtime.
+async fn shallow_clone(
+    repo_url: &str,
+    git_ref: &str,
+    target_dir: &Path,
+) -> Result<(), ExecutionError> {
     let is_sha = git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit());
 
     if is_sha {
         // SHA refs can't use --branch; use init + fetch + checkout instead
-        let init = Command::new("git")
+        let init = tokio::process::Command::new("git")
             .arg("init")
             .arg(target_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
+            .await
             .map_err(|e| ExecutionError::Execution(format!("Failed to execute git init: {}", e)))?;
         if !init.success() {
             return Err(ExecutionError::Execution(format!(
@@ -654,17 +661,19 @@ fn shallow_clone(repo_url: &str, git_ref: &str, target_dir: &Path) -> Result<(),
             )));
         }
 
-        let fetch = Command::new("git")
+        let fetch = tokio::process::Command::new("git")
             .arg("-C")
             .arg(target_dir)
             .arg("fetch")
             .arg("--depth")
             .arg("1")
+            .arg("--")
             .arg(repo_url)
             .arg(git_ref)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
+            .await
             .map_err(|e| {
                 ExecutionError::Execution(format!("Failed to execute git fetch: {}", e))
             })?;
@@ -678,7 +687,7 @@ fn shallow_clone(repo_url: &str, git_ref: &str, target_dir: &Path) -> Result<(),
             )));
         }
 
-        let checkout = Command::new("git")
+        let checkout = tokio::process::Command::new("git")
             .arg("-C")
             .arg(target_dir)
             .arg("checkout")
@@ -686,6 +695,7 @@ fn shallow_clone(repo_url: &str, git_ref: &str, target_dir: &Path) -> Result<(),
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
+            .await
             .map_err(|e| {
                 ExecutionError::Execution(format!("Failed to execute git checkout: {}", e))
             })?;
@@ -700,17 +710,20 @@ fn shallow_clone(repo_url: &str, git_ref: &str, target_dir: &Path) -> Result<(),
         }
     } else {
         // Branch/tag refs: standard shallow clone
-        let output = Command::new("git")
+        let output = tokio::process::Command::new("git")
             .arg("clone")
             .arg("--depth")
             .arg("1")
+            .arg("--single-branch")
             .arg("--branch")
             .arg(git_ref)
+            .arg("--")
             .arg(repo_url)
             .arg(target_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
+            .await
             .map_err(|e| ExecutionError::Execution(format!("Failed to execute git: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1356,7 +1369,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         })?;
                         let repo_url = format!("https://github.com/{}.git", action_info.repository);
                         let repo_dir = tempdir.path().join("action");
-                        shallow_clone(&repo_url, &action_info.version, &repo_dir)?;
+                        shallow_clone(&repo_url, &action_info.version, &repo_dir).await?;
                         // tempdir must stay alive until execute_composite_action completes
                         execute_composite_action(
                             ctx.step,
@@ -1534,21 +1547,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         cmd.push("-c");
                         cmd.push("echo 'Executing Docker action'");
                     } else if action_info.is_local {
-                        // For local actions, we need more complex logic based on action type
-                        let action_dir = Path::new(&action_info.repository);
-                        let action_yaml = action_dir.join("action.yml");
-
-                        if action_yaml.exists() {
-                            // Parse the action.yml to determine action type
-                            // This is simplified - real implementation would be more complex
-                            cmd.push("sh");
-                            cmd.push("-c");
-                            cmd.push("echo 'Local action without action.yml'");
-                        } else {
-                            cmd.push("sh");
-                            cmd.push("-c");
-                            cmd.push("echo 'Local action without action.yml'");
-                        }
+                        // Local actions: run a placeholder since full local action
+                        // execution is handled by the Composite branch above
+                        cmd.push("sh");
+                        cmd.push("-c");
+                        cmd.push("echo 'Local action executed'");
                     } else {
                         // For GitHub actions, check if we have special handling
                         if let Err(e) = emulation::handle_special_action(uses).await {
@@ -2274,7 +2277,7 @@ async fn execute_reusable_workflow_job(
             // Clone into a subdirectory within tempdir to get clean structure
             let repo_dir = tempdir.path().join("cloned_repo");
 
-            shallow_clone(&repo_url, &r#ref, &repo_dir)?;
+            shallow_clone(&repo_url, &r#ref, &repo_dir).await?;
             let joined = repo_dir.join(path);
 
             if !joined.exists() {
