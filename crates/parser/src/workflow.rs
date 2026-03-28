@@ -119,7 +119,7 @@ impl WorkflowDefinition {
         // Parse GitHub action reference like "actions/checkout@v3"
         let parts: Vec<&str> = action_ref.split('@').collect();
 
-        let (repo, _) = if parts.len() > 1 {
+        let (repo, version) = if parts.len() > 1 {
             (parts[0], parts[1])
         } else {
             (parts[0], "main") // Default to main if no version specified
@@ -127,6 +127,7 @@ impl WorkflowDefinition {
 
         ActionInfo {
             repository: repo.to_string(),
+            version: version.to_string(),
             is_docker: repo.starts_with("docker://"),
             is_local: repo.starts_with("./"),
         }
@@ -136,6 +137,7 @@ impl WorkflowDefinition {
 #[derive(Debug, Clone)]
 pub struct ActionInfo {
     pub repository: String,
+    pub version: String,
     pub is_docker: bool,
     pub is_local: bool,
 }

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use ignore::{gitignore::GitignoreBuilder, Match};
 
+use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
@@ -574,7 +575,27 @@ async fn prepare_action(
         }
     }
 
-    // GitHub action: determine appropriate image based on action type
+    // GitHub action: try to fetch action.yml from the remote repository
+    if !action.repository.is_empty() && !action.version.is_empty() {
+        match action_resolver::resolve_remote_action(&action.repository, &action.version).await {
+            Ok(resolved) => {
+                let image = action_resolver::image_for_action(&resolved.action_type);
+                wrkflw_logging::info(&format!(
+                    "🔄 Resolved action '{}' -> image '{}'",
+                    action.repository, image
+                ));
+                return Ok(image);
+            }
+            Err(e) => {
+                wrkflw_logging::warning(&format!(
+                    "Could not fetch action.yml for {}@{}: {}. Falling back to built-in mapping.",
+                    action.repository, action.version, e
+                ));
+            }
+        }
+    }
+
+    // Fallback: determine appropriate image based on hardcoded action type mapping
     let image = determine_action_image(&action.repository);
     Ok(image)
 }
@@ -1188,19 +1209,58 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             let image = prepare_action(&action_info, ctx.runtime).await?;
 
             // Special handling for composite actions
-            if image == "composite" && action_info.is_local {
-                // Handle composite action
-                let action_path = Path::new(&action_info.repository);
-                execute_composite_action(
-                    ctx.step,
-                    action_path,
-                    &step_env,
-                    ctx.working_dir,
-                    ctx.runtime,
-                    ctx.runner_image,
-                    ctx.verbose,
-                )
-                .await?
+            if image == "composite" {
+                if action_info.is_local {
+                    // Handle local composite action
+                    let action_path = Path::new(&action_info.repository);
+                    execute_composite_action(
+                        ctx.step,
+                        action_path,
+                        &step_env,
+                        ctx.working_dir,
+                        ctx.runtime,
+                        ctx.runner_image,
+                        ctx.verbose,
+                    )
+                    .await?
+                } else {
+                    // Handle remote composite action: clone the repo and execute
+                    let tempdir = tempfile::tempdir().map_err(|e| {
+                        ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
+                    })?;
+                    let repo_url = format!("https://github.com/{}.git", action_info.repository);
+                    let repo_dir = tempdir.path().join("action");
+                    let status = Command::new("git")
+                        .arg("clone")
+                        .arg("--depth")
+                        .arg("1")
+                        .arg("--branch")
+                        .arg(&action_info.version)
+                        .arg(&repo_url)
+                        .arg(&repo_dir)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map_err(|e| {
+                            ExecutionError::Execution(format!("Failed to execute git: {}", e))
+                        })?;
+                    if !status.success() {
+                        return Err(ExecutionError::Execution(format!(
+                            "Failed to clone composite action {}@{}",
+                            action_info.repository, action_info.version
+                        )));
+                    }
+                    execute_composite_action(
+                        ctx.step,
+                        &repo_dir,
+                        &step_env,
+                        ctx.working_dir,
+                        ctx.runtime,
+                        ctx.runner_image,
+                        ctx.verbose,
+                    )
+                    .await?
+                }
             } else {
                 // Regular Docker or JavaScript action processing
                 // ... (rest of the existing code for handling regular actions)

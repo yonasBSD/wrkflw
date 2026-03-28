@@ -2,6 +2,7 @@
 
 #![allow(unused_variables, unused_assignments)]
 
+pub mod action_resolver;
 pub mod dependency;
 pub mod docker;
 pub mod engine;
