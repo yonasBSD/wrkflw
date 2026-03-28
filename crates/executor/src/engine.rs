@@ -642,6 +642,8 @@ async fn shallow_clone(
     git_ref: &str,
     target_dir: &Path,
 ) -> Result<(), ExecutionError> {
+    // NOTE: This only detects SHA-1 (40 hex chars). Git's SHA-256 transition uses
+    // 64-char hashes — update this check if/when GitHub adopts SHA-256 refs.
     let is_sha = git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit());
 
     if is_sha {

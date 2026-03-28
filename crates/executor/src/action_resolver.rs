@@ -76,6 +76,7 @@ static ACTION_CACHE: Lazy<RwLock<BoundedCache>> = Lazy::new(|| RwLock::new(Bound
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .user_agent("wrkflw")
         .build()
         .expect("Failed to create HTTP client")
 });
@@ -133,15 +134,40 @@ async fn fetch_and_parse(
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
             let no_redirect_client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .user_agent("wrkflw")
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-            no_redirect_client
+            let auth_response = no_redirect_client
                 .get(&url)
                 .header("Authorization", format!("token {}", token))
                 .send()
                 .await
-                .map_err(|e| format!("Failed to fetch {}: {}", url, e))?
+                .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
+
+            // The no-redirect policy prevents token leakage, but the server may
+            // legitimately redirect (CDN routing). If we get a 3xx, follow it
+            // without the auth header to avoid leaking the token.
+            if auth_response.status().is_redirection() {
+                if let Some(location) = auth_response.headers().get(reqwest::header::LOCATION) {
+                    let redirect_url = location
+                        .to_str()
+                        .map_err(|_| "Invalid redirect URL encoding".to_string())?;
+                    HTTP_CLIENT
+                        .get(redirect_url)
+                        .send()
+                        .await
+                        .map_err(|e| format!("Failed to follow redirect {}: {}", redirect_url, e))?
+                } else {
+                    return Err(format!(
+                        "HTTP {} (redirect with no Location header) fetching {}",
+                        auth_response.status(),
+                        url
+                    ));
+                }
+            } else {
+                auth_response
+            }
         } else {
             response
         }
