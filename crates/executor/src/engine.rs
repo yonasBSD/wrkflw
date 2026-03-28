@@ -529,11 +529,19 @@ impl From<String> for ExecutionError {
     }
 }
 
+/// The result of preparing an action — either a Docker image to run or a composite action.
+enum PreparedAction {
+    /// A Docker image name to pull and run the action in.
+    Image(String),
+    /// A composite action that needs special step-based execution.
+    Composite,
+}
+
 // Add Action preparation functions
 async fn prepare_action(
     action: &ActionInfo,
     runtime: &dyn ContainerRuntime,
-) -> Result<String, ExecutionError> {
+) -> Result<PreparedAction, ExecutionError> {
     if action.is_docker {
         // Docker action: pull the image
         let image = action.repository.trim_start_matches("docker://");
@@ -543,7 +551,7 @@ async fn prepare_action(
             .await
             .map_err(|e| ExecutionError::Runtime(format!("Failed to pull Docker image: {}", e)))?;
 
-        return Ok(image.to_string());
+        return Ok(PreparedAction::Image(image.to_string()));
     }
 
     if action.is_local {
@@ -567,31 +575,48 @@ async fn prepare_action(
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
-            return Ok(tag);
+            return Ok(PreparedAction::Image(tag));
         } else {
             // It's a JavaScript or composite action
             // For simplicity, we'll use node to run it (this would need more work for full support)
-            return Ok("node:20-slim".to_string());
+            return Ok(PreparedAction::Image("node:20-slim".to_string()));
         }
     }
 
     // GitHub action: try to fetch action.yml from the remote repository
     if !action.repository.is_empty() && !action.version.is_empty() {
         match action_resolver::resolve_remote_action(&action.repository, &action.version).await {
-            Ok(resolved) => {
-                if let Some(image) = action_resolver::image_for_action(&resolved.action_type) {
+            Ok(resolved) => match &resolved.action_type {
+                action_resolver::ActionType::Node { version } => {
+                    let image = format!("node:{}-slim", version);
                     wrkflw_logging::info(&format!(
-                        "🔄 Resolved action '{}' -> image '{}'",
+                        "Resolved action '{}' -> image '{}'",
                         action.repository, image
                     ));
-                    return Ok(image);
+                    return Ok(PreparedAction::Image(image));
                 }
-                // DockerBuild: action bundles its own Dockerfile, fall back to hardcoded mapping
-                wrkflw_logging::info(&format!(
-                    "🔄 Action '{}' bundles a Dockerfile. Falling back to built-in mapping.",
-                    action.repository
-                ));
-            }
+                action_resolver::ActionType::Docker { image } => {
+                    wrkflw_logging::info(&format!(
+                        "Resolved action '{}' -> image '{}'",
+                        action.repository, image
+                    ));
+                    return Ok(PreparedAction::Image(image.clone()));
+                }
+                action_resolver::ActionType::Composite => {
+                    wrkflw_logging::info(&format!(
+                        "Resolved action '{}' as composite action",
+                        action.repository
+                    ));
+                    return Ok(PreparedAction::Composite);
+                }
+                action_resolver::ActionType::DockerBuild => {
+                    return Err(ExecutionError::Execution(format!(
+                        "Action '{}' bundles its own Dockerfile (runs.image = Dockerfile). \
+                             Building remote Dockerfiles is not yet supported.",
+                        action.repository
+                    )));
+                }
+            },
             Err(e) => {
                 wrkflw_logging::warning(&format!(
                     "Could not fetch action.yml for {}@{}: {}. Falling back to built-in mapping.",
@@ -603,7 +628,102 @@ async fn prepare_action(
 
     // Fallback: determine appropriate image based on hardcoded action type mapping
     let image = determine_action_image(&action.repository);
-    Ok(image)
+    Ok(PreparedAction::Image(image))
+}
+
+/// Shallow-clone a GitHub repository at a specific ref (branch, tag, or SHA).
+///
+/// For branch/tag refs, uses `git clone --depth 1 --branch <ref>`.
+/// For SHA refs (40 hex chars), uses `git init` + `git fetch --depth 1` + `git checkout`.
+fn shallow_clone(repo_url: &str, git_ref: &str, target_dir: &Path) -> Result<(), ExecutionError> {
+    let is_sha = git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit());
+
+    if is_sha {
+        // SHA refs can't use --branch; use init + fetch + checkout instead
+        let init = Command::new("git")
+            .arg("init")
+            .arg(target_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| ExecutionError::Execution(format!("Failed to execute git init: {}", e)))?;
+        if !init.success() {
+            return Err(ExecutionError::Execution(format!(
+                "git init failed for {}",
+                target_dir.display()
+            )));
+        }
+
+        let fetch = Command::new("git")
+            .arg("-C")
+            .arg(target_dir)
+            .arg("fetch")
+            .arg("--depth")
+            .arg("1")
+            .arg(repo_url)
+            .arg(git_ref)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| {
+                ExecutionError::Execution(format!("Failed to execute git fetch: {}", e))
+            })?;
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            return Err(ExecutionError::Execution(format!(
+                "Failed to fetch {}@{}: {}",
+                repo_url,
+                git_ref,
+                stderr.trim()
+            )));
+        }
+
+        let checkout = Command::new("git")
+            .arg("-C")
+            .arg(target_dir)
+            .arg("checkout")
+            .arg("FETCH_HEAD")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| {
+                ExecutionError::Execution(format!("Failed to execute git checkout: {}", e))
+            })?;
+        if !checkout.status.success() {
+            let stderr = String::from_utf8_lossy(&checkout.stderr);
+            return Err(ExecutionError::Execution(format!(
+                "Failed to checkout FETCH_HEAD for {}@{}: {}",
+                repo_url,
+                git_ref,
+                stderr.trim()
+            )));
+        }
+    } else {
+        // Branch/tag refs: standard shallow clone
+        let output = Command::new("git")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg("--branch")
+            .arg(git_ref)
+            .arg(repo_url)
+            .arg(target_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| ExecutionError::Execution(format!("Failed to execute git: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ExecutionError::Execution(format!(
+                "Failed to clone {}@{}: {}",
+                repo_url,
+                git_ref,
+                stderr.trim()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Determine the appropriate Docker image for a GitHub action
@@ -1212,123 +1332,297 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             }
         } else {
             // Get action info
-            let image = prepare_action(&action_info, ctx.runtime).await?;
+            let prepared = prepare_action(&action_info, ctx.runtime).await?;
 
-            // Special handling for composite actions
-            if image == "composite" {
-                if action_info.is_local {
-                    // Handle local composite action
-                    let action_path = Path::new(&action_info.repository);
-                    execute_composite_action(
-                        ctx.step,
-                        action_path,
-                        &step_env,
-                        ctx.working_dir,
-                        ctx.runtime,
-                        ctx.runner_image,
-                        ctx.verbose,
-                    )
-                    .await?
-                } else {
-                    // Handle remote composite action: clone the repo and execute
-                    let tempdir = tempfile::tempdir().map_err(|e| {
-                        ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
-                    })?;
-                    let repo_url = format!("https://github.com/{}.git", action_info.repository);
-                    let repo_dir = tempdir.path().join("action");
-                    let output = Command::new("git")
-                        .arg("clone")
-                        .arg("--depth")
-                        .arg("1")
-                        .arg("--branch")
-                        .arg(&action_info.version)
-                        .arg(&repo_url)
-                        .arg(&repo_dir)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .output()
-                        .map_err(|e| {
-                            ExecutionError::Execution(format!("Failed to execute git: {}", e))
+            match prepared {
+                PreparedAction::Composite => {
+                    if action_info.is_local {
+                        // Handle local composite action
+                        let action_path = Path::new(&action_info.repository);
+                        execute_composite_action(
+                            ctx.step,
+                            action_path,
+                            &step_env,
+                            ctx.working_dir,
+                            ctx.runtime,
+                            ctx.runner_image,
+                            ctx.verbose,
+                        )
+                        .await?
+                    } else {
+                        // Handle remote composite action: clone the repo and execute
+                        let tempdir = tempfile::tempdir().map_err(|e| {
+                            ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
                         })?;
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        return Err(ExecutionError::Execution(format!(
-                            "Failed to clone composite action {}@{}: {}",
-                            action_info.repository,
-                            action_info.version,
-                            stderr.trim()
-                        )));
+                        let repo_url = format!("https://github.com/{}.git", action_info.repository);
+                        let repo_dir = tempdir.path().join("action");
+                        shallow_clone(&repo_url, &action_info.version, &repo_dir)?;
+                        // tempdir must stay alive until execute_composite_action completes
+                        execute_composite_action(
+                            ctx.step,
+                            &repo_dir,
+                            &step_env,
+                            ctx.working_dir,
+                            ctx.runtime,
+                            ctx.runner_image,
+                            ctx.verbose,
+                        )
+                        .await?
                     }
-                    execute_composite_action(
-                        ctx.step,
-                        &repo_dir,
-                        &step_env,
-                        ctx.working_dir,
-                        ctx.runtime,
-                        ctx.runner_image,
-                        ctx.verbose,
-                    )
-                    .await?
                 }
-            } else {
-                // Regular Docker or JavaScript action processing
-                // ... (rest of the existing code for handling regular actions)
-                // Build command for Docker action
-                let mut cmd = Vec::new();
-                let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
+                PreparedAction::Image(image) => {
+                    // Regular Docker or JavaScript action processing
+                    // ... (rest of the existing code for handling regular actions)
+                    // Build command for Docker action
+                    let mut cmd = Vec::new();
+                    let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
 
-                // Special handling for Rust actions
-                if uses.starts_with("actions-rs/") || uses.starts_with("dtolnay/rust-toolchain") {
-                    wrkflw_logging::info(
-                        "🔄 Detected Rust action - using system Rust installation",
-                    );
-
-                    // For toolchain action, verify Rust is installed
-                    if uses.starts_with("actions-rs/toolchain@")
-                        || uses.starts_with("dtolnay/rust-toolchain@")
+                    // Special handling for Rust actions
+                    if uses.starts_with("actions-rs/") || uses.starts_with("dtolnay/rust-toolchain")
                     {
-                        let rustc_version = Command::new("rustc")
-                            .arg("--version")
-                            .output()
-                            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-                            .unwrap_or_else(|_| "not found".to_string());
+                        wrkflw_logging::info(
+                            "🔄 Detected Rust action - using system Rust installation",
+                        );
 
-                        wrkflw_logging::info(&format!(
-                            "🔄 Using system Rust: {}",
-                            rustc_version.trim()
-                        ));
+                        // For toolchain action, verify Rust is installed
+                        if uses.starts_with("actions-rs/toolchain@")
+                            || uses.starts_with("dtolnay/rust-toolchain@")
+                        {
+                            let rustc_version = Command::new("rustc")
+                                .arg("--version")
+                                .output()
+                                .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+                                .unwrap_or_else(|_| "not found".to_string());
 
-                        // Return success since we're using system Rust
-                        return Ok(StepResult {
-                            name: step_name,
-                            status: StepStatus::Success,
-                            output: format!("Using system Rust: {}", rustc_version.trim()),
-                        });
+                            wrkflw_logging::info(&format!(
+                                "🔄 Using system Rust: {}",
+                                rustc_version.trim()
+                            ));
+
+                            // Return success since we're using system Rust
+                            return Ok(StepResult {
+                                name: step_name,
+                                status: StepStatus::Success,
+                                output: format!("Using system Rust: {}", rustc_version.trim()),
+                            });
+                        }
+
+                        // For cargo action, execute cargo commands directly
+                        if uses.starts_with("actions-rs/cargo@") {
+                            let cargo_version = Command::new("cargo")
+                                .arg("--version")
+                                .output()
+                                .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+                                .unwrap_or_else(|_| "not found".to_string());
+
+                            wrkflw_logging::info(&format!(
+                                "🔄 Using system Rust/Cargo: {}",
+                                cargo_version.trim()
+                            ));
+
+                            // Get the command from the 'with' parameters
+                            if let Some(with_params) = &ctx.step.with {
+                                if let Some(command) = with_params.get("command") {
+                                    wrkflw_logging::info(&format!(
+                                        "🔄 Found command parameter: {}",
+                                        command
+                                    ));
+
+                                    // Build the actual command
+                                    let mut real_command = format!("cargo {}", command);
+
+                                    // Add any arguments if specified
+                                    if let Some(args) = with_params.get("args") {
+                                        if !args.is_empty() {
+                                            // Resolve GitHub-style variables in args
+                                            let resolved_args = if args.contains("${{") {
+                                                wrkflw_logging::info(&format!(
+                                                    "🔄 Resolving workflow variables in: {}",
+                                                    args
+                                                ));
+
+                                                // Handle common matrix variables
+                                                let mut resolved =
+                                                    args.replace("${{ matrix.target }}", "");
+                                                resolved = resolved.replace("${{ matrix.os }}", "");
+
+                                                // Handle any remaining ${{ variables }} by removing them
+                                                let re_pattern =
+                                                    regex::Regex::new(r"\$\{\{\s*([^}]+)\s*\}\}")
+                                                        .unwrap_or_else(|_| {
+                                                            wrkflw_logging::error(
+                                                                "Failed to create regex pattern",
+                                                            );
+                                                            regex::Regex::new(r"\$\{\{.*?\}\}")
+                                                                .unwrap()
+                                                        });
+
+                                                let resolved = re_pattern
+                                                    .replace_all(&resolved, "")
+                                                    .to_string();
+                                                wrkflw_logging::info(&format!(
+                                                    "🔄 Resolved to: {}",
+                                                    resolved
+                                                ));
+
+                                                resolved.trim().to_string()
+                                            } else {
+                                                args.clone()
+                                            };
+
+                                            // Only add if we have something left after resolving variables
+                                            // and it's not just "--target" without a value
+                                            if !resolved_args.is_empty()
+                                                && resolved_args != "--target"
+                                            {
+                                                real_command
+                                                    .push_str(&format!(" {}", resolved_args));
+                                            }
+                                        }
+                                    }
+
+                                    wrkflw_logging::info(&format!(
+                                        "🔄 Running actual command: {}",
+                                        real_command
+                                    ));
+
+                                    // Execute the command
+                                    let mut cmd = Command::new("sh");
+                                    cmd.arg("-c");
+                                    cmd.arg(&real_command);
+                                    cmd.current_dir(ctx.working_dir);
+
+                                    // Add environment variables
+                                    for (key, value) in step_env {
+                                        cmd.env(key, value);
+                                    }
+
+                                    match cmd.output() {
+                                        Ok(output) => {
+                                            let exit_code = output.status.code().unwrap_or(-1);
+                                            let stdout =
+                                                String::from_utf8_lossy(&output.stdout).to_string();
+                                            let stderr =
+                                                String::from_utf8_lossy(&output.stderr).to_string();
+
+                                            return Ok(StepResult {
+                                                name: step_name,
+                                                status: if exit_code == 0 {
+                                                    StepStatus::Success
+                                                } else {
+                                                    StepStatus::Failure
+                                                },
+                                                output: format!("{}\n{}", stdout, stderr),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            return Ok(StepResult {
+                                                name: step_name,
+                                                status: StepStatus::Failure,
+                                                output: format!("Failed to execute command: {}", e),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
-                    // For cargo action, execute cargo commands directly
-                    if uses.starts_with("actions-rs/cargo@") {
-                        let cargo_version = Command::new("cargo")
-                            .arg("--version")
-                            .output()
-                            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-                            .unwrap_or_else(|_| "not found".to_string());
+                    if action_info.is_docker {
+                        // Docker actions just run the container
+                        cmd.push("sh");
+                        cmd.push("-c");
+                        cmd.push("echo 'Executing Docker action'");
+                    } else if action_info.is_local {
+                        // For local actions, we need more complex logic based on action type
+                        let action_dir = Path::new(&action_info.repository);
+                        let action_yaml = action_dir.join("action.yml");
 
-                        wrkflw_logging::info(&format!(
-                            "🔄 Using system Rust/Cargo: {}",
-                            cargo_version.trim()
+                        if action_yaml.exists() {
+                            // Parse the action.yml to determine action type
+                            // This is simplified - real implementation would be more complex
+                            cmd.push("sh");
+                            cmd.push("-c");
+                            cmd.push("echo 'Local action without action.yml'");
+                        } else {
+                            cmd.push("sh");
+                            cmd.push("-c");
+                            cmd.push("echo 'Local action without action.yml'");
+                        }
+                    } else {
+                        // For GitHub actions, check if we have special handling
+                        if let Err(e) = emulation::handle_special_action(uses).await {
+                            // Log error but continue
+                            println!("   Warning: Special action handling failed: {}", e);
+                        }
+
+                        // Check if we should hide GitHub action messages
+                        let hide_action_value = ctx
+                            .job_env
+                            .get("WRKFLW_HIDE_ACTION_MESSAGES")
+                            .cloned()
+                            .unwrap_or_else(|| "not set".to_string());
+
+                        wrkflw_logging::debug(&format!(
+                            "WRKFLW_HIDE_ACTION_MESSAGES value: {}",
+                            hide_action_value
                         ));
 
-                        // Get the command from the 'with' parameters
-                        if let Some(with_params) = &ctx.step.with {
-                            if let Some(command) = with_params.get("command") {
-                                wrkflw_logging::info(&format!(
-                                    "🔄 Found command parameter: {}",
-                                    command
-                                ));
+                        let hide_messages = hide_action_value == "true";
+                        wrkflw_logging::debug(&format!("Should hide messages: {}", hide_messages));
 
-                                // Build the actual command
-                                let mut real_command = format!("cargo {}", command);
+                        // Only log a message to the console if we're showing action messages
+                        if !hide_messages {
+                            // For Emulation mode, log a message about what action would be executed
+                            println!("   ⚙️ Would execute GitHub action: {}", uses);
+                        }
+
+                        // Extract the actual command from the GitHub action if applicable
+                        let mut should_run_real_command = false;
+                        let mut real_command_parts = Vec::new();
+
+                        // Check if this action has 'with' parameters that specify a command to run
+                        if let Some(with_params) = &ctx.step.with {
+                            // Common GitHub action pattern: has a 'command' parameter
+                            if let Some(cmd) = with_params.get("command") {
+                                if ctx.verbose {
+                                    wrkflw_logging::info(&format!(
+                                        "🔄 Found command parameter: {}",
+                                        cmd
+                                    ));
+                                }
+
+                                // Convert to real command based on action type patterns
+                                if uses.contains("cargo") || uses.contains("rust") {
+                                    // Cargo command pattern
+                                    real_command_parts.push("cargo".to_string());
+                                    real_command_parts.push(cmd.clone());
+                                    should_run_real_command = true;
+                                } else if uses.contains("node") || uses.contains("npm") {
+                                    // Node.js command pattern
+                                    if cmd == "npm" || cmd == "yarn" || cmd == "pnpm" {
+                                        real_command_parts.push(cmd.clone());
+                                    } else {
+                                        real_command_parts.push("npm".to_string());
+                                        real_command_parts.push("run".to_string());
+                                        real_command_parts.push(cmd.clone());
+                                    }
+                                    should_run_real_command = true;
+                                } else if uses.contains("python") || uses.contains("pip") {
+                                    // Python command pattern
+                                    if cmd == "pip" {
+                                        real_command_parts.push("pip".to_string());
+                                    } else {
+                                        real_command_parts.push("python".to_string());
+                                        real_command_parts.push("-m".to_string());
+                                        real_command_parts.push(cmd.clone());
+                                    }
+                                    should_run_real_command = true;
+                                } else {
+                                    // Generic command - try to execute directly if available
+                                    real_command_parts.push(cmd.clone());
+                                    should_run_real_command = true;
+                                }
 
                                 // Add any arguments if specified
                                 if let Some(args) = with_params.get("args") {
@@ -1368,359 +1662,177 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                         };
 
                                         // Only add if we have something left after resolving variables
-                                        // and it's not just "--target" without a value
-                                        if !resolved_args.is_empty() && resolved_args != "--target"
-                                        {
-                                            real_command.push_str(&format!(" {}", resolved_args));
+                                        if !resolved_args.is_empty() {
+                                            real_command_parts.push(resolved_args);
                                         }
                                     }
                                 }
-
-                                wrkflw_logging::info(&format!(
-                                    "🔄 Running actual command: {}",
-                                    real_command
-                                ));
-
-                                // Execute the command
-                                let mut cmd = Command::new("sh");
-                                cmd.arg("-c");
-                                cmd.arg(&real_command);
-                                cmd.current_dir(ctx.working_dir);
-
-                                // Add environment variables
-                                for (key, value) in step_env {
-                                    cmd.env(key, value);
-                                }
-
-                                match cmd.output() {
-                                    Ok(output) => {
-                                        let exit_code = output.status.code().unwrap_or(-1);
-                                        let stdout =
-                                            String::from_utf8_lossy(&output.stdout).to_string();
-                                        let stderr =
-                                            String::from_utf8_lossy(&output.stderr).to_string();
-
-                                        return Ok(StepResult {
-                                            name: step_name,
-                                            status: if exit_code == 0 {
-                                                StepStatus::Success
-                                            } else {
-                                                StepStatus::Failure
-                                            },
-                                            output: format!("{}\n{}", stdout, stderr),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        return Ok(StepResult {
-                                            name: step_name,
-                                            status: StepStatus::Failure,
-                                            output: format!("Failed to execute command: {}", e),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if action_info.is_docker {
-                    // Docker actions just run the container
-                    cmd.push("sh");
-                    cmd.push("-c");
-                    cmd.push("echo 'Executing Docker action'");
-                } else if action_info.is_local {
-                    // For local actions, we need more complex logic based on action type
-                    let action_dir = Path::new(&action_info.repository);
-                    let action_yaml = action_dir.join("action.yml");
-
-                    if action_yaml.exists() {
-                        // Parse the action.yml to determine action type
-                        // This is simplified - real implementation would be more complex
-                        cmd.push("sh");
-                        cmd.push("-c");
-                        cmd.push("echo 'Local action without action.yml'");
-                    } else {
-                        cmd.push("sh");
-                        cmd.push("-c");
-                        cmd.push("echo 'Local action without action.yml'");
-                    }
-                } else {
-                    // For GitHub actions, check if we have special handling
-                    if let Err(e) = emulation::handle_special_action(uses).await {
-                        // Log error but continue
-                        println!("   Warning: Special action handling failed: {}", e);
-                    }
-
-                    // Check if we should hide GitHub action messages
-                    let hide_action_value = ctx
-                        .job_env
-                        .get("WRKFLW_HIDE_ACTION_MESSAGES")
-                        .cloned()
-                        .unwrap_or_else(|| "not set".to_string());
-
-                    wrkflw_logging::debug(&format!(
-                        "WRKFLW_HIDE_ACTION_MESSAGES value: {}",
-                        hide_action_value
-                    ));
-
-                    let hide_messages = hide_action_value == "true";
-                    wrkflw_logging::debug(&format!("Should hide messages: {}", hide_messages));
-
-                    // Only log a message to the console if we're showing action messages
-                    if !hide_messages {
-                        // For Emulation mode, log a message about what action would be executed
-                        println!("   ⚙️ Would execute GitHub action: {}", uses);
-                    }
-
-                    // Extract the actual command from the GitHub action if applicable
-                    let mut should_run_real_command = false;
-                    let mut real_command_parts = Vec::new();
-
-                    // Check if this action has 'with' parameters that specify a command to run
-                    if let Some(with_params) = &ctx.step.with {
-                        // Common GitHub action pattern: has a 'command' parameter
-                        if let Some(cmd) = with_params.get("command") {
-                            if ctx.verbose {
-                                wrkflw_logging::info(&format!(
-                                    "🔄 Found command parameter: {}",
-                                    cmd
-                                ));
-                            }
-
-                            // Convert to real command based on action type patterns
-                            if uses.contains("cargo") || uses.contains("rust") {
-                                // Cargo command pattern
-                                real_command_parts.push("cargo".to_string());
-                                real_command_parts.push(cmd.clone());
-                                should_run_real_command = true;
-                            } else if uses.contains("node") || uses.contains("npm") {
-                                // Node.js command pattern
-                                if cmd == "npm" || cmd == "yarn" || cmd == "pnpm" {
-                                    real_command_parts.push(cmd.clone());
-                                } else {
-                                    real_command_parts.push("npm".to_string());
-                                    real_command_parts.push("run".to_string());
-                                    real_command_parts.push(cmd.clone());
-                                }
-                                should_run_real_command = true;
-                            } else if uses.contains("python") || uses.contains("pip") {
-                                // Python command pattern
-                                if cmd == "pip" {
-                                    real_command_parts.push("pip".to_string());
-                                } else {
-                                    real_command_parts.push("python".to_string());
-                                    real_command_parts.push("-m".to_string());
-                                    real_command_parts.push(cmd.clone());
-                                }
-                                should_run_real_command = true;
-                            } else {
-                                // Generic command - try to execute directly if available
-                                real_command_parts.push(cmd.clone());
-                                should_run_real_command = true;
-                            }
-
-                            // Add any arguments if specified
-                            if let Some(args) = with_params.get("args") {
-                                if !args.is_empty() {
-                                    // Resolve GitHub-style variables in args
-                                    let resolved_args = if args.contains("${{") {
-                                        wrkflw_logging::info(&format!(
-                                            "🔄 Resolving workflow variables in: {}",
-                                            args
-                                        ));
-
-                                        // Handle common matrix variables
-                                        let mut resolved = args.replace("${{ matrix.target }}", "");
-                                        resolved = resolved.replace("${{ matrix.os }}", "");
-
-                                        // Handle any remaining ${{ variables }} by removing them
-                                        let re_pattern =
-                                            regex::Regex::new(r"\$\{\{\s*([^}]+)\s*\}\}")
-                                                .unwrap_or_else(|_| {
-                                                    wrkflw_logging::error(
-                                                        "Failed to create regex pattern",
-                                                    );
-                                                    regex::Regex::new(r"\$\{\{.*?\}\}").unwrap()
-                                                });
-
-                                        let resolved =
-                                            re_pattern.replace_all(&resolved, "").to_string();
-                                        wrkflw_logging::info(&format!(
-                                            "🔄 Resolved to: {}",
-                                            resolved
-                                        ));
-
-                                        resolved.trim().to_string()
-                                    } else {
-                                        args.clone()
-                                    };
-
-                                    // Only add if we have something left after resolving variables
-                                    if !resolved_args.is_empty() {
-                                        real_command_parts.push(resolved_args);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if should_run_real_command && !real_command_parts.is_empty() {
-                        // Build a final command string
-                        let command_str = real_command_parts.join(" ");
-                        wrkflw_logging::info(&format!(
-                            "🔄 Running actual command: {}",
-                            command_str
-                        ));
-
-                        // Replace the emulated command with a shell command to execute our command
-                        cmd.clear();
-                        cmd.push("sh");
-                        cmd.push("-c");
-                        owned_strings.push(command_str);
-                        cmd.push(owned_strings.last().unwrap());
-                    } else {
-                        // Fall back to emulation for actions we don't know how to execute
-                        cmd.clear();
-                        cmd.push("sh");
-                        cmd.push("-c");
-
-                        let echo_msg = format!("echo 'Would execute GitHub action: {}'", uses);
-                        owned_strings.push(echo_msg);
-                        cmd.push(owned_strings.last().unwrap());
-                    }
-                }
-
-                // Convert 'with' parameters to environment variables
-                if let Some(with_params) = &ctx.step.with {
-                    for (key, value) in with_params {
-                        step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
-                    }
-                }
-
-                // Convert environment HashMap to Vec<(&str, &str)> for container runtime
-                let env_vars: Vec<(&str, &str)> = step_env
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-
-                // Define the standard workspace path inside the container
-                let container_workspace = Path::new("/github/workspace");
-
-                // Set up volume mapping from host working dir to container workspace
-                let mut volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
-
-                // Also mount the GitHub environment files directory if GITHUB_ENV is set
-                if let Some(github_env_path) = ctx.job_env.get("GITHUB_ENV") {
-                    if let Some(github_dir) = Path::new(github_env_path).parent() {
-                        if let Some(github_parent) = github_dir.parent() {
-                            volumes.push((github_parent, github_parent));
-                        }
-                    }
-                }
-
-                let output = ctx
-                    .runtime
-                    .run_container(
-                        &image,
-                        &cmd.to_vec(),
-                        &env_vars,
-                        container_workspace,
-                        &volumes,
-                    )
-                    .await
-                    .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
-
-                // Check if this was called from 'run' branch - don't try to hide these outputs
-                if output.exit_code == 0 {
-                    // For GitHub actions in verbose mode, provide more detailed emulation information
-                    let output_text = if ctx.verbose
-                        && uses.contains('/')
-                        && !uses.starts_with("./")
-                    {
-                        let mut detailed_output =
-                            format!("Would execute GitHub action: {}\n", uses);
-
-                        // Add information about the action inputs if available
-                        if let Some(with_params) = &ctx.step.with {
-                            detailed_output.push_str("\nAction inputs:\n");
-                            for (key, value) in with_params {
-                                detailed_output.push_str(&format!("  {}: {}\n", key, value));
                             }
                         }
 
-                        // Add standard GitHub action environment variables
-                        detailed_output.push_str("\nEnvironment variables:\n");
-                        for (key, value) in step_env.iter() {
-                            if key.starts_with("GITHUB_") || key.starts_with("INPUT_") {
-                                detailed_output.push_str(&format!("  {}: {}\n", key, value));
-                            }
-                        }
+                        if should_run_real_command && !real_command_parts.is_empty() {
+                            // Build a final command string
+                            let command_str = real_command_parts.join(" ");
+                            wrkflw_logging::info(&format!(
+                                "🔄 Running actual command: {}",
+                                command_str
+                            ));
 
-                        // Include the original output
-                        detailed_output
-                            .push_str(&format!("\nOutput:\n{}\n{}", output.stdout, output.stderr));
-                        detailed_output
-                    } else {
-                        format!("{}\n{}", output.stdout, output.stderr)
-                    };
-
-                    // Check if this is a cargo command that failed
-                    if output.exit_code != 0 && (uses.contains("cargo") || uses.contains("rust")) {
-                        // Add detailed error information for cargo commands
-                        let mut error_details = format!(
-                            "\n\n❌ Command failed with exit code: {}\n",
-                            output.exit_code
-                        );
-
-                        // Add command details
-                        error_details.push_str(&format!("Command: {}\n", cmd.join(" ")));
-
-                        // Add environment details
-                        error_details.push_str("\nEnvironment:\n");
-                        for (key, value) in step_env.iter() {
-                            if key.starts_with("GITHUB_")
-                                || key.starts_with("INPUT_")
-                                || key.starts_with("RUST")
-                            {
-                                error_details.push_str(&format!("  {}: {}\n", key, value));
-                            }
-                        }
-
-                        // Add detailed output
-                        error_details.push_str("\nDetailed output:\n");
-                        error_details.push_str(&output.stdout);
-                        error_details.push_str(&output.stderr);
-
-                        // Return failure with detailed error information
-                        return Ok(StepResult {
-                            name: step_name,
-                            status: StepStatus::Failure,
-                            output: format!("{}\n{}", output_text, error_details),
-                        });
-                    }
-
-                    StepResult {
-                        name: step_name,
-                        status: if output.exit_code == 0 {
-                            StepStatus::Success
+                            // Replace the emulated command with a shell command to execute our command
+                            cmd.clear();
+                            cmd.push("sh");
+                            cmd.push("-c");
+                            owned_strings.push(command_str);
+                            cmd.push(owned_strings.last().unwrap());
                         } else {
-                            StepStatus::Failure
-                        },
-                        output: format!(
-                            "Exit code: {}
+                            // Fall back to emulation for actions we don't know how to execute
+                            cmd.clear();
+                            cmd.push("sh");
+                            cmd.push("-c");
+
+                            let echo_msg = format!("echo 'Would execute GitHub action: {}'", uses);
+                            owned_strings.push(echo_msg);
+                            cmd.push(owned_strings.last().unwrap());
+                        }
+                    }
+
+                    // Convert 'with' parameters to environment variables
+                    if let Some(with_params) = &ctx.step.with {
+                        for (key, value) in with_params {
+                            step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
+                        }
+                    }
+
+                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
+                    let env_vars: Vec<(&str, &str)> = step_env
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    // Define the standard workspace path inside the container
+                    let container_workspace = Path::new("/github/workspace");
+
+                    // Set up volume mapping from host working dir to container workspace
+                    let mut volumes: Vec<(&Path, &Path)> =
+                        vec![(ctx.working_dir, container_workspace)];
+
+                    // Also mount the GitHub environment files directory if GITHUB_ENV is set
+                    if let Some(github_env_path) = ctx.job_env.get("GITHUB_ENV") {
+                        if let Some(github_dir) = Path::new(github_env_path).parent() {
+                            if let Some(github_parent) = github_dir.parent() {
+                                volumes.push((github_parent, github_parent));
+                            }
+                        }
+                    }
+
+                    let output = ctx
+                        .runtime
+                        .run_container(
+                            &image,
+                            &cmd.to_vec(),
+                            &env_vars,
+                            container_workspace,
+                            &volumes,
+                        )
+                        .await
+                        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+
+                    // Check if this was called from 'run' branch - don't try to hide these outputs
+                    if output.exit_code == 0 {
+                        // For GitHub actions in verbose mode, provide more detailed emulation information
+                        let output_text = if ctx.verbose
+                            && uses.contains('/')
+                            && !uses.starts_with("./")
+                        {
+                            let mut detailed_output =
+                                format!("Would execute GitHub action: {}\n", uses);
+
+                            // Add information about the action inputs if available
+                            if let Some(with_params) = &ctx.step.with {
+                                detailed_output.push_str("\nAction inputs:\n");
+                                for (key, value) in with_params {
+                                    detailed_output.push_str(&format!("  {}: {}\n", key, value));
+                                }
+                            }
+
+                            // Add standard GitHub action environment variables
+                            detailed_output.push_str("\nEnvironment variables:\n");
+                            for (key, value) in step_env.iter() {
+                                if key.starts_with("GITHUB_") || key.starts_with("INPUT_") {
+                                    detailed_output.push_str(&format!("  {}: {}\n", key, value));
+                                }
+                            }
+
+                            // Include the original output
+                            detailed_output.push_str(&format!(
+                                "\nOutput:\n{}\n{}",
+                                output.stdout, output.stderr
+                            ));
+                            detailed_output
+                        } else {
+                            format!("{}\n{}", output.stdout, output.stderr)
+                        };
+
+                        // Check if this is a cargo command that failed
+                        if output.exit_code != 0
+                            && (uses.contains("cargo") || uses.contains("rust"))
+                        {
+                            // Add detailed error information for cargo commands
+                            let mut error_details = format!(
+                                "\n\n❌ Command failed with exit code: {}\n",
+                                output.exit_code
+                            );
+
+                            // Add command details
+                            error_details.push_str(&format!("Command: {}\n", cmd.join(" ")));
+
+                            // Add environment details
+                            error_details.push_str("\nEnvironment:\n");
+                            for (key, value) in step_env.iter() {
+                                if key.starts_with("GITHUB_")
+                                    || key.starts_with("INPUT_")
+                                    || key.starts_with("RUST")
+                                {
+                                    error_details.push_str(&format!("  {}: {}\n", key, value));
+                                }
+                            }
+
+                            // Add detailed output
+                            error_details.push_str("\nDetailed output:\n");
+                            error_details.push_str(&output.stdout);
+                            error_details.push_str(&output.stderr);
+
+                            // Return failure with detailed error information
+                            return Ok(StepResult {
+                                name: step_name,
+                                status: StepStatus::Failure,
+                                output: format!("{}\n{}", output_text, error_details),
+                            });
+                        }
+
+                        StepResult {
+                            name: step_name,
+                            status: if output.exit_code == 0 {
+                                StepStatus::Success
+                            } else {
+                                StepStatus::Failure
+                            },
+                            output: format!(
+                                "Exit code: {}
 {}
 {}",
-                            output.exit_code, output.stdout, output.stderr
-                        ),
-                    }
-                } else {
-                    StepResult {
-                        name: step_name,
-                        status: StepStatus::Failure,
-                        output: format!(
-                            "Exit code: {}\n{}\n{}",
-                            output.exit_code, output.stdout, output.stderr
-                        ),
+                                output.exit_code, output.stdout, output.stderr
+                            ),
+                        }
+                    } else {
+                        StepResult {
+                            name: step_name,
+                            status: StepStatus::Failure,
+                            output: format!(
+                                "Exit code: {}\n{}\n{}",
+                                output.exit_code, output.stdout, output.stderr
+                            ),
+                        }
                     }
                 }
             }
@@ -2162,23 +2274,7 @@ async fn execute_reusable_workflow_job(
             // Clone into a subdirectory within tempdir to get clean structure
             let repo_dir = tempdir.path().join("cloned_repo");
 
-            // git clone
-            let status = Command::new("git")
-                .arg("clone")
-                .arg("--depth")
-                .arg("1")
-                .arg("--branch")
-                .arg(&r#ref)
-                .arg(&repo_url)
-                .arg(&repo_dir)
-                .status()
-                .map_err(|e| ExecutionError::Execution(format!("Failed to execute git: {}", e)))?;
-            if !status.success() {
-                return Err(ExecutionError::Execution(format!(
-                    "Failed to clone {}@{}",
-                    repo_url, r#ref
-                )));
-            }
+            shallow_clone(&repo_url, &r#ref, &repo_dir)?;
             let joined = repo_dir.join(path);
 
             if !joined.exists() {

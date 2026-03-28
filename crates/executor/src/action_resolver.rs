@@ -25,8 +25,10 @@ pub struct ResolvedAction {
     pub definition: Option<serde_yaml::Value>,
 }
 
-/// In-memory cache for resolved actions keyed by "owner/repo@version".
-static ACTION_CACHE: Lazy<Mutex<HashMap<String, Option<ResolvedAction>>>> =
+/// In-memory cache for successfully resolved actions keyed by "owner/repo@version".
+/// Only successful resolutions are cached — transient failures are not persisted
+/// so that retries can succeed if network conditions improve.
+static ACTION_CACHE: Lazy<Mutex<HashMap<String, ResolvedAction>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Shared HTTP client to avoid repeated TLS initialization.
@@ -48,9 +50,7 @@ pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<Resolved
     {
         let cache = ACTION_CACHE.lock().await;
         if let Some(cached) = cache.get(&cache_key) {
-            return cached
-                .clone()
-                .ok_or_else(|| format!("Previously failed to resolve {}", cache_key));
+            return Ok(cached.clone());
         }
     }
 
@@ -60,10 +60,10 @@ pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<Resolved
         Err(_) => fetch_and_parse(repo, version, "action.yaml").await,
     };
 
-    // Cache the result (including failures as None)
-    {
+    // Only cache successful resolutions — transient failures should be retryable
+    if let Ok(ref resolved) = result {
         let mut cache = ACTION_CACHE.lock().await;
-        cache.insert(cache_key, result.as_ref().ok().cloned());
+        cache.insert(cache_key, resolved.clone());
     }
 
     result
@@ -164,19 +164,6 @@ fn parse_using(using: &str, runs: &serde_yaml::Value) -> Result<ActionType, Stri
     }
 }
 
-/// Return the appropriate Docker image for a resolved action type.
-///
-/// Returns `None` for action types that cannot be mapped to a pullable image
-/// (e.g., `DockerBuild` actions that need their Dockerfile built from the repo).
-pub fn image_for_action(action_type: &ActionType) -> Option<String> {
-    match action_type {
-        ActionType::Node { version } => Some(format!("node:{}-slim", version)),
-        ActionType::Docker { image } => Some(image.clone()),
-        ActionType::Composite => Some("composite".to_string()),
-        ActionType::DockerBuild => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,41 +249,6 @@ runs:
 name: 'Bad Action'
 "#;
         assert!(parse_action_definition(yaml).is_err());
-    }
-
-    #[test]
-    fn test_image_for_node() {
-        assert_eq!(
-            image_for_action(&ActionType::Node { version: 20 }),
-            Some("node:20-slim".to_string())
-        );
-        assert_eq!(
-            image_for_action(&ActionType::Node { version: 16 }),
-            Some("node:16-slim".to_string())
-        );
-    }
-
-    #[test]
-    fn test_image_for_docker() {
-        assert_eq!(
-            image_for_action(&ActionType::Docker {
-                image: "rust:latest".to_string()
-            }),
-            Some("rust:latest".to_string())
-        );
-    }
-
-    #[test]
-    fn test_image_for_composite() {
-        assert_eq!(
-            image_for_action(&ActionType::Composite),
-            Some("composite".to_string())
-        );
-    }
-
-    #[test]
-    fn test_image_for_docker_build() {
-        assert_eq!(image_for_action(&ActionType::DockerBuild), None);
     }
 
     #[test]
