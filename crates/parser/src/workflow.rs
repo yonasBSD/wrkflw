@@ -73,12 +73,29 @@ where
     }
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct ContainerCredentials {
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+}
+
+impl serde::Serialize for ContainerCredentials {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ContainerCredentials", 2)?;
+        state.serialize_field("username", &self.username)?;
+        if self.password.is_some() {
+            state.serialize_field("password", &"[REDACTED]")?;
+        } else {
+            state.serialize_field("password", &None::<String>)?;
+        }
+        state.end()
+    }
 }
 
 impl std::fmt::Debug for ContainerCredentials {
@@ -574,5 +591,28 @@ jobs:
         let job = parsed.jobs.get("test").unwrap();
         let container = job.container.as_ref().unwrap();
         assert_eq!(container.image, "ghcr.io/owner/image:latest");
+    }
+
+    #[test]
+    fn container_credentials_serialize_redacts_password() {
+        let creds = ContainerCredentials {
+            username: Some("user".into()),
+            password: Some("super-secret".into()),
+        };
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains("user"));
+        assert!(json.contains("[REDACTED]"));
+        assert!(!json.contains("super-secret"));
+    }
+
+    #[test]
+    fn container_credentials_serialize_null_password() {
+        let creds = ContainerCredentials {
+            username: Some("user".into()),
+            password: None,
+        };
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains("user"));
+        assert!(!json.contains("[REDACTED]"));
     }
 }

@@ -2215,7 +2215,12 @@ fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String {
 
 fn get_effective_runner_image(job: &Job) -> String {
     if let Some(ref container) = job.container {
-        container.image.clone()
+        if container.image.is_empty() {
+            wrkflw_logging::warning("container image is empty, falling back to runs-on");
+            get_runner_image_from_opt(&job.runs_on)
+        } else {
+            container.image.clone()
+        }
     } else {
         get_runner_image_from_opt(&job.runs_on)
     }
@@ -2287,6 +2292,13 @@ fn prepare_container_mounts(
             let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
             match parts.len() {
                 3 => {
+                    if parts[0].is_empty() || parts[1].is_empty() {
+                        wrkflw_logging::warning(&format!(
+                            "skipping volume spec with empty host or container path: '{}'",
+                            vol_spec
+                        ));
+                        continue;
+                    }
                     wrkflw_logging::warning(&format!(
                         "volume mount option '{}' in '{}' is not yet supported and will be ignored",
                         parts[2], vol_spec
@@ -2294,6 +2306,13 @@ fn prepare_container_mounts(
                     owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
                 }
                 2 => {
+                    if parts[0].is_empty() || parts[1].is_empty() {
+                        wrkflw_logging::warning(&format!(
+                            "skipping volume spec with empty host or container path: '{}'",
+                            vol_spec
+                        ));
+                        continue;
+                    }
                     owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
                 }
                 _ => {
@@ -3174,6 +3193,44 @@ mod tests {
         assert!(!step_env.contains_key("GITHUB_OUTPUT"));
         assert!(!step_env.contains_key("GITHUB_PATH"));
         assert!(!step_env.contains_key("GITHUB_STEP_SUMMARY"));
+    }
+
+    #[test]
+    fn effective_runner_image_empty_image_falls_back() {
+        let job = make_job(
+            Some(JobContainer {
+                image: "".into(),
+                credentials: None,
+                env: HashMap::new(),
+                ports: None,
+                volumes: None,
+                options: None,
+            }),
+            Some(vec!["ubuntu-latest".into()]),
+        );
+        let image = get_effective_runner_image(&job);
+        // Should fall back to runs-on, not return empty string
+        assert!(!image.is_empty());
+    }
+
+    #[test]
+    fn container_mounts_skips_empty_container_path() {
+        let mut step_env = HashMap::new();
+        let job_env = HashMap::new();
+
+        let container = JobContainer {
+            image: "node:18".into(),
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: Some(vec!["/host:".into(), ":/container".into()]),
+            options: None,
+        };
+
+        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+
+        // Both specs have an empty path component and should be skipped
+        assert!(volumes.is_empty());
     }
 
     // --- container env precedence tests ---
