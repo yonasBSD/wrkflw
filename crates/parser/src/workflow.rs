@@ -46,6 +46,82 @@ where
     }
 }
 
+// Custom deserializer for container field that handles both string and object formats
+fn deserialize_container<'de, D>(deserializer: D) -> Result<Option<JobContainer>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrContainer {
+        String(String),
+        Container(JobContainer),
+    }
+
+    let value = Option::<StringOrContainer>::deserialize(deserializer)?;
+    match value {
+        Some(StringOrContainer::String(image)) => Ok(Some(JobContainer {
+            image,
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: None,
+            options: None,
+        })),
+        Some(StringOrContainer::Container(c)) => Ok(Some(c)),
+        None => Ok(None),
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ContainerCredentials {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl serde::Serialize for ContainerCredentials {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ContainerCredentials", 2)?;
+        state.serialize_field("username", &self.username)?;
+        if self.password.is_some() {
+            state.serialize_field("password", &"[REDACTED]")?;
+        } else {
+            state.serialize_field("password", &None::<String>)?;
+        }
+        state.end()
+    }
+}
+
+impl std::fmt::Debug for ContainerCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct JobContainer {
+    pub image: String,
+    #[serde(default)]
+    pub credentials: Option<ContainerCredentials>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub ports: Option<Vec<String>>,
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
+    #[serde(default)]
+    pub options: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
     pub name: String,
@@ -62,6 +138,8 @@ pub struct Job {
     pub runs_on: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_needs")]
     pub needs: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_container")]
+    pub container: Option<JobContainer>,
     #[serde(default)]
     pub steps: Vec<Step>,
     #[serde(default)]
@@ -393,5 +471,148 @@ jobs:
             "Expected workflow to parse successfully, got: {:?}",
             parsed.err()
         );
+    }
+
+    #[test]
+    fn parse_container_string_format() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: container-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: node:18
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let container = job.container.as_ref().expect("container should be Some");
+        assert_eq!(container.image, "node:18");
+        assert!(container.env.is_empty());
+        assert!(container.credentials.is_none());
+        assert!(container.ports.is_none());
+        assert!(container.volumes.is_none());
+        assert!(container.options.is_none());
+    }
+
+    #[test]
+    fn parse_container_object_format() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: container-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: node:18-alpine
+      credentials:
+        username: user
+        password: pass
+      env:
+        NODE_ENV: production
+      ports:
+        - "8080:80"
+      volumes:
+        - /host/path:/container/path
+        - /single-path
+      options: "--cpus 2"
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let container = job.container.as_ref().expect("container should be Some");
+        assert_eq!(container.image, "node:18-alpine");
+        assert_eq!(container.env.get("NODE_ENV").unwrap(), "production");
+        let creds = container.credentials.as_ref().unwrap();
+        assert_eq!(creds.username.as_deref(), Some("user"));
+        assert_eq!(creds.password.as_deref(), Some("pass"));
+        assert_eq!(
+            container.ports.as_ref().unwrap(),
+            &vec!["8080:80".to_string()]
+        );
+        let volumes = container.volumes.as_ref().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0], "/host/path:/container/path");
+        assert_eq!(volumes[1], "/single-path");
+        assert_eq!(container.options.as_deref(), Some("--cpus 2"));
+    }
+
+    #[test]
+    fn parse_container_absent() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: no-container
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        assert!(job.container.is_none());
+    }
+
+    #[test]
+    fn parse_container_image_with_colon_in_tag() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: container-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: ghcr.io/owner/image:latest
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let container = job.container.as_ref().unwrap();
+        assert_eq!(container.image, "ghcr.io/owner/image:latest");
+    }
+
+    #[test]
+    fn container_credentials_serialize_redacts_password() {
+        let creds = ContainerCredentials {
+            username: Some("user".into()),
+            password: Some("super-secret".into()),
+        };
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains("user"));
+        assert!(json.contains("[REDACTED]"));
+        assert!(!json.contains("super-secret"));
+    }
+
+    #[test]
+    fn container_credentials_serialize_null_password() {
+        let creds = ContainerCredentials {
+            username: Some("user".into()),
+            password: None,
+        };
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains("user"));
+        assert!(!json.contains("[REDACTED]"));
     }
 }

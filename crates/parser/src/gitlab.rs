@@ -132,6 +132,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         let mut job = workflow::Job {
             runs_on: Some(vec!["ubuntu-latest".to_string()]), // Default runner
             needs: None,
+            container: None,
             steps: Vec::new(),
             env: HashMap::new(),
             matrix: None,
