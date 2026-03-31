@@ -2243,12 +2243,27 @@ fn prepare_container_mounts(
     let github_mount = if let Some(github_env_path) = job_env.get("GITHUB_ENV") {
         if let Some(github_dir) = Path::new(github_env_path).parent() {
             if is_container_runtime {
-                step_env.insert("GITHUB_ENV".into(), "/github/workflow/env".into());
-                step_env.insert("GITHUB_OUTPUT".into(), "/github/workflow/output".into());
-                step_env.insert("GITHUB_PATH".into(), "/github/workflow/path".into());
+                // Remap each GitHub env file path by deriving the filename from the actual
+                // host path, so the mapping stays correct if environment.rs renames them.
+                let remap_env_file = |env_key: &str, job_env: &HashMap<String, String>| -> String {
+                    job_env
+                        .get(env_key)
+                        .and_then(|p| {
+                            Path::new(p)
+                                .file_name()
+                                .map(|f| format!("/github/workflow/{}", f.to_string_lossy()))
+                        })
+                        .unwrap_or_else(|| format!("/github/workflow/{}", env_key.to_lowercase()))
+                };
+                step_env.insert("GITHUB_ENV".into(), remap_env_file("GITHUB_ENV", job_env));
+                step_env.insert(
+                    "GITHUB_OUTPUT".into(),
+                    remap_env_file("GITHUB_OUTPUT", job_env),
+                );
+                step_env.insert("GITHUB_PATH".into(), remap_env_file("GITHUB_PATH", job_env));
                 step_env.insert(
                     "GITHUB_STEP_SUMMARY".into(),
-                    "/github/workflow/step_summary".into(),
+                    remap_env_file("GITHUB_STEP_SUMMARY", job_env),
                 );
                 Some((github_dir.to_path_buf(), container_github_dir.to_path_buf()))
             } else {
@@ -2264,16 +2279,20 @@ fn prepare_container_mounts(
     };
 
     // Collect container-defined volumes
-    let mut owned_volume_paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Docker volume syntax: host:container[:options] — splitn(3) handles the optional :ro/:rw
+    let mut owned_volume_paths: Vec<VolumePathPair> = Vec::new();
     if let Some(container_volumes) = container_config.and_then(|c| c.volumes.as_ref()) {
         for vol_spec in container_volumes {
-            let parts: Vec<&str> = vol_spec.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
-            } else {
-                // Single path: mount at same location inside container
-                let p = PathBuf::from(parts[0]);
-                owned_volume_paths.push((p.clone(), p));
+            let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
+            match parts.len() {
+                2 | 3 => {
+                    owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
+                }
+                _ => {
+                    // Single path: mount at same location inside container
+                    let p = PathBuf::from(parts[0]);
+                    owned_volume_paths.push((p.clone(), p));
+                }
             }
         }
     }
@@ -2925,5 +2944,208 @@ mod tests {
     #[test]
     fn is_git_sha_rejects_41_chars() {
         assert!(!is_git_sha("a81bbbf8298c0fa03ea29cdc473d45769f9536750"));
+    }
+
+    // --- get_effective_runner_image tests ---
+
+    fn make_job(container: Option<JobContainer>, runs_on: Option<Vec<String>>) -> Job {
+        Job {
+            runs_on,
+            needs: None,
+            container,
+            steps: Vec::new(),
+            env: HashMap::new(),
+            matrix: None,
+            services: HashMap::new(),
+            if_condition: None,
+            outputs: None,
+            permissions: None,
+            uses: None,
+            with: None,
+            secrets: None,
+        }
+    }
+
+    #[test]
+    fn effective_runner_image_prefers_container() {
+        let job = make_job(
+            Some(JobContainer {
+                image: "alpine:3.22".into(),
+                credentials: None,
+                env: HashMap::new(),
+                ports: None,
+                volumes: None,
+                options: None,
+            }),
+            Some(vec!["ubuntu-latest".into()]),
+        );
+        assert_eq!(get_effective_runner_image(&job), "alpine:3.22");
+    }
+
+    #[test]
+    fn effective_runner_image_falls_back_to_runs_on() {
+        let job = make_job(None, Some(vec!["ubuntu-latest".into()]));
+        let image = get_effective_runner_image(&job);
+        // Should delegate to get_runner_image_from_opt, not return empty
+        assert!(!image.is_empty());
+    }
+
+    // --- prepare_container_mounts tests ---
+
+    #[test]
+    fn container_mounts_docker_runtime_remaps_env_paths() {
+        let mut step_env = HashMap::new();
+        step_env.insert("WRKFLW_RUNTIME_MODE".into(), "docker".into());
+
+        let mut job_env = HashMap::new();
+        job_env.insert("GITHUB_ENV".into(), "/tmp/abc/github/env".into());
+        job_env.insert("GITHUB_OUTPUT".into(), "/tmp/abc/github/output".into());
+        job_env.insert("GITHUB_PATH".into(), "/tmp/abc/github/path".into());
+        job_env.insert(
+            "GITHUB_STEP_SUMMARY".into(),
+            "/tmp/abc/github/step_summary".into(),
+        );
+
+        let (volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+
+        // Env vars should be remapped to container paths
+        assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
+        assert_eq!(
+            step_env.get("GITHUB_OUTPUT").unwrap(),
+            "/github/workflow/output"
+        );
+        assert_eq!(
+            step_env.get("GITHUB_PATH").unwrap(),
+            "/github/workflow/path"
+        );
+        assert_eq!(
+            step_env.get("GITHUB_STEP_SUMMARY").unwrap(),
+            "/github/workflow/step_summary"
+        );
+
+        // Should mount the github dir at /github/workflow
+        let (host, container) = github_mount.unwrap();
+        assert_eq!(host, PathBuf::from("/tmp/abc/github"));
+        assert_eq!(container, PathBuf::from("/github/workflow"));
+
+        // No container config volumes
+        assert!(volumes.is_empty());
+    }
+
+    #[test]
+    fn container_mounts_non_container_runtime_does_not_remap() {
+        let mut step_env = HashMap::new();
+        // No WRKFLW_RUNTIME_MODE set
+
+        let mut job_env = HashMap::new();
+        job_env.insert("GITHUB_ENV".into(), "/tmp/abc/github/env".into());
+
+        let (_volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+
+        // Env vars should NOT be remapped
+        assert!(step_env.get("GITHUB_ENV").is_none());
+
+        // Should mount the parent directory identity-mapped
+        let (host, container) = github_mount.unwrap();
+        assert_eq!(host, container); // identity mount
+    }
+
+    #[test]
+    fn container_mounts_no_github_env() {
+        let mut step_env = HashMap::new();
+        let job_env = HashMap::new(); // no GITHUB_ENV
+
+        let (volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+
+        assert!(github_mount.is_none());
+        assert!(volumes.is_empty());
+    }
+
+    #[test]
+    fn container_mounts_parses_host_container_volumes() {
+        let mut step_env = HashMap::new();
+        let job_env = HashMap::new();
+
+        let container = JobContainer {
+            image: "node:18".into(),
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: Some(vec!["/host/data:/container/data".into()]),
+            options: None,
+        };
+
+        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].0, PathBuf::from("/host/data"));
+        assert_eq!(volumes[0].1, PathBuf::from("/container/data"));
+    }
+
+    #[test]
+    fn container_mounts_parses_single_path_volumes() {
+        let mut step_env = HashMap::new();
+        let job_env = HashMap::new();
+
+        let container = JobContainer {
+            image: "node:18".into(),
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: Some(vec!["/data".into()]),
+            options: None,
+        };
+
+        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].0, PathBuf::from("/data"));
+        assert_eq!(volumes[0].1, PathBuf::from("/data"));
+    }
+
+    #[test]
+    fn container_mounts_strips_docker_options_from_volumes() {
+        let mut step_env = HashMap::new();
+        let job_env = HashMap::new();
+
+        let container = JobContainer {
+            image: "node:18".into(),
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: Some(vec!["/host:/container:ro".into(), "/src:/dest:rw".into()]),
+            options: None,
+        };
+
+        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+
+        assert_eq!(volumes.len(), 2);
+        // :ro should be stripped — container path should be clean
+        assert_eq!(volumes[0].0, PathBuf::from("/host"));
+        assert_eq!(volumes[0].1, PathBuf::from("/container"));
+        // :rw should be stripped
+        assert_eq!(volumes[1].0, PathBuf::from("/src"));
+        assert_eq!(volumes[1].1, PathBuf::from("/dest"));
+    }
+
+    #[test]
+    fn container_mounts_podman_runtime_remaps_env_paths() {
+        let mut step_env = HashMap::new();
+        step_env.insert("WRKFLW_RUNTIME_MODE".into(), "podman".into());
+
+        let mut job_env = HashMap::new();
+        job_env.insert("GITHUB_ENV".into(), "/tmp/xyz/github/env".into());
+        job_env.insert("GITHUB_OUTPUT".into(), "/tmp/xyz/github/output".into());
+        job_env.insert("GITHUB_PATH".into(), "/tmp/xyz/github/path".into());
+        job_env.insert(
+            "GITHUB_STEP_SUMMARY".into(),
+            "/tmp/xyz/github/step_summary".into(),
+        );
+
+        let (_, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+
+        // Podman should behave identically to Docker for remapping
+        assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
+        assert!(github_mount.is_some());
     }
 }
