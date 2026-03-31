@@ -2245,26 +2245,22 @@ fn prepare_container_mounts(
             if is_container_runtime {
                 // Remap each GitHub env file path by deriving the filename from the actual
                 // host path, so the mapping stays correct if environment.rs renames them.
-                let remap_env_file = |env_key: &str, job_env: &HashMap<String, String>| -> String {
-                    job_env
-                        .get(env_key)
-                        .and_then(|p| {
-                            Path::new(p)
-                                .file_name()
-                                .map(|f| format!("/github/workflow/{}", f.to_string_lossy()))
-                        })
-                        .unwrap_or_else(|| format!("/github/workflow/{}", env_key.to_lowercase()))
-                };
-                step_env.insert("GITHUB_ENV".into(), remap_env_file("GITHUB_ENV", job_env));
-                step_env.insert(
-                    "GITHUB_OUTPUT".into(),
-                    remap_env_file("GITHUB_OUTPUT", job_env),
-                );
-                step_env.insert("GITHUB_PATH".into(), remap_env_file("GITHUB_PATH", job_env));
-                step_env.insert(
-                    "GITHUB_STEP_SUMMARY".into(),
-                    remap_env_file("GITHUB_STEP_SUMMARY", job_env),
-                );
+                // Only remap keys that actually exist in job_env to avoid phantom paths.
+                for env_key in &[
+                    "GITHUB_ENV",
+                    "GITHUB_OUTPUT",
+                    "GITHUB_PATH",
+                    "GITHUB_STEP_SUMMARY",
+                ] {
+                    if let Some(host_path) = job_env.get(*env_key) {
+                        if let Some(filename) = Path::new(host_path).file_name() {
+                            step_env.insert(
+                                env_key.to_string(),
+                                format!("/github/workflow/{}", filename.to_string_lossy()),
+                            );
+                        }
+                    }
+                }
                 Some((github_dir.to_path_buf(), container_github_dir.to_path_buf()))
             } else {
                 github_dir
@@ -2285,7 +2281,14 @@ fn prepare_container_mounts(
         for vol_spec in container_volumes {
             let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
             match parts.len() {
-                2 | 3 => {
+                3 => {
+                    wrkflw_logging::warning(&format!(
+                        "volume mount option '{}' in '{}' is not yet supported and will be ignored",
+                        parts[2], vol_spec
+                    ));
+                    owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
+                }
+                2 => {
                     owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
                 }
                 _ => {
@@ -3147,5 +3150,66 @@ mod tests {
         // Podman should behave identically to Docker for remapping
         assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
         assert!(github_mount.is_some());
+    }
+
+    #[test]
+    fn container_mounts_only_remaps_existing_env_keys() {
+        let mut step_env = HashMap::new();
+        step_env.insert("WRKFLW_RUNTIME_MODE".into(), "docker".into());
+
+        let mut job_env = HashMap::new();
+        // Only set GITHUB_ENV — the others are absent
+        job_env.insert("GITHUB_ENV".into(), "/tmp/abc/github/env".into());
+
+        let (_, _) = prepare_container_mounts(&mut step_env, &job_env, None);
+
+        // GITHUB_ENV should be remapped
+        assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
+        // Others should NOT be inserted (no phantom paths)
+        assert!(step_env.get("GITHUB_OUTPUT").is_none());
+        assert!(step_env.get("GITHUB_PATH").is_none());
+        assert!(step_env.get("GITHUB_STEP_SUMMARY").is_none());
+    }
+
+    // --- container env precedence tests ---
+
+    #[test]
+    fn container_env_has_lowest_precedence() {
+        // Simulate the env merging logic from execute_job:
+        // 1. Container env is inserted with or_insert (lowest precedence)
+        // 2. Job env is inserted with insert (overrides container env)
+        let mut job_env = HashMap::new();
+
+        // Step 1: container env (lowest precedence)
+        let container = JobContainer {
+            image: "node:18".into(),
+            credentials: None,
+            env: HashMap::from([
+                ("SHARED".into(), "from-container".into()),
+                ("CONTAINER_ONLY".into(), "container-value".into()),
+            ]),
+            ports: None,
+            volumes: None,
+            options: None,
+        };
+        for (key, value) in &container.env {
+            job_env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+
+        // Step 2: job env (overrides container env)
+        let job_level_env: HashMap<String, String> = HashMap::from([
+            ("SHARED".into(), "from-job".into()),
+            ("JOB_ONLY".into(), "job-value".into()),
+        ]);
+        for (key, value) in &job_level_env {
+            job_env.insert(key.clone(), value.clone());
+        }
+
+        // Job-level env wins for shared keys
+        assert_eq!(job_env.get("SHARED").unwrap(), "from-job");
+        // Container-only keys are preserved
+        assert_eq!(job_env.get("CONTAINER_ONLY").unwrap(), "container-value");
+        // Job-only keys are preserved
+        assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
     }
 }
