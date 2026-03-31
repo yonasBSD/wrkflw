@@ -46,6 +46,56 @@ where
     }
 }
 
+// Custom deserializer for container field that handles both string and object formats
+fn deserialize_container<'de, D>(deserializer: D) -> Result<Option<JobContainer>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrContainer {
+        String(String),
+        Container(JobContainer),
+    }
+
+    let value = Option::<StringOrContainer>::deserialize(deserializer)?;
+    match value {
+        Some(StringOrContainer::String(image)) => Ok(Some(JobContainer {
+            image,
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: None,
+            options: None,
+        })),
+        Some(StringOrContainer::Container(c)) => Ok(Some(c)),
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContainerCredentials {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct JobContainer {
+    pub image: String,
+    #[serde(default)]
+    pub credentials: Option<ContainerCredentials>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub ports: Option<Vec<String>>,
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
+    #[serde(default)]
+    pub options: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
     pub name: String,
@@ -62,6 +112,8 @@ pub struct Job {
     pub runs_on: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_needs")]
     pub needs: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_container")]
+    pub container: Option<JobContainer>,
     #[serde(default)]
     pub steps: Vec<Step>,
     #[serde(default)]

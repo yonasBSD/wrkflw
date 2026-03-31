@@ -20,7 +20,9 @@ use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
 use wrkflw_models::gitlab::Pipeline;
 use wrkflw_parser::gitlab::{self, parse_pipeline};
-use wrkflw_parser::workflow::{self, parse_workflow, ActionInfo, Job, WorkflowDefinition};
+use wrkflw_parser::workflow::{
+    self, parse_workflow, ActionInfo, Job, JobContainer, WorkflowDefinition,
+};
 use wrkflw_runtime::container::ContainerRuntime;
 use wrkflw_runtime::emulation;
 use wrkflw_secrets::{SecretConfig, SecretManager, SecretMasker, SecretSubstitution};
@@ -962,7 +964,14 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Clone context and add job-specific variables
     let mut job_env = ctx.env_context.clone();
 
-    // Add job-level environment variables
+    // Add container-level environment variables (lowest precedence)
+    if let Some(ref container) = job.container {
+        for (key, value) in &container.env {
+            job_env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    // Add job-level environment variables (overrides container env)
     for (key, value) in &job.env {
         job_env.insert(key.clone(), value.clone());
     }
@@ -985,8 +994,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let mut job_success = true;
 
     // Execute job steps
-    // Determine runner image (default if not provided)
-    let runner_image_value = get_runner_image_from_opt(&job.runs_on);
+    // Determine runner image: prefer job container image, fall back to runs-on mapping
+    let runner_image_value = get_effective_runner_image(job);
 
     for (idx, step) in job.steps.iter().enumerate() {
         let step_result = execute_step(StepExecutionContext {
@@ -1001,6 +1010,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             matrix_combination: &None,
             secret_manager: ctx.secret_manager,
             secret_masker: ctx.secret_masker,
+            container_config: job.container.as_ref(),
         })
         .await;
 
@@ -1160,7 +1170,14 @@ async fn execute_matrix_job(
     let mut job_env = base_env_context.clone();
     environment::add_matrix_context(&mut job_env, combination);
 
-    // Add job-level environment variables
+    // Add container-level environment variables (lowest precedence)
+    if let Some(ref container) = job_template.container {
+        for (key, value) in &container.env {
+            job_env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    // Add job-level environment variables (overrides container env)
     for (key, value) in &job_template.env {
         // TODO: Substitute matrix variable references in env values
         job_env.insert(key.clone(), value.clone());
@@ -1184,8 +1201,8 @@ async fn execute_matrix_job(
         true
     } else {
         // Execute each step
-        // Determine runner image (default if not provided)
-        let runner_image_value = get_runner_image_from_opt(&job_template.runs_on);
+        // Determine runner image: prefer job container image, fall back to runs-on mapping
+        let runner_image_value = get_effective_runner_image(job_template);
 
         for (idx, step) in job_template.steps.iter().enumerate() {
             match execute_step(StepExecutionContext {
@@ -1200,6 +1217,7 @@ async fn execute_matrix_job(
                 matrix_combination: &Some(combination.values.clone()),
                 secret_manager: None, // Matrix execution context doesn't have secrets yet
                 secret_masker: None,
+                container_config: job_template.container.as_ref(),
             })
             .await
             {
@@ -1272,6 +1290,7 @@ struct StepExecutionContext<'a> {
     secret_manager: Option<&'a SecretManager>,
     #[allow(dead_code)] // Planned for future implementation
     secret_masker: Option<&'a SecretMasker>,
+    container_config: Option<&'a JobContainer>,
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -1725,12 +1744,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
-                    let env_vars: Vec<(&str, &str)> = step_env
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-
                     // Define the standard workspace path inside the container
                     let container_workspace = Path::new("/github/workspace");
 
@@ -1738,14 +1751,58 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     let mut volumes: Vec<(&Path, &Path)> =
                         vec![(ctx.working_dir, container_workspace)];
 
-                    // Also mount the GitHub environment files directory if GITHUB_ENV is set
+                    // Mount GitHub environment files directory and remap paths for container runtimes
+                    let container_github_dir = Path::new("/github/workflow");
+                    let is_container_runtime = step_env
+                        .get("WRKFLW_RUNTIME_MODE")
+                        .map(|m| m == "docker" || m == "podman")
+                        .unwrap_or(false);
                     if let Some(github_env_path) = ctx.job_env.get("GITHUB_ENV") {
                         if let Some(github_dir) = Path::new(github_env_path).parent() {
-                            if let Some(github_parent) = github_dir.parent() {
+                            if is_container_runtime {
+                                volumes.push((github_dir, container_github_dir));
+                                step_env.insert("GITHUB_ENV".into(), "/github/workflow/env".into());
+                                step_env.insert(
+                                    "GITHUB_OUTPUT".into(),
+                                    "/github/workflow/output".into(),
+                                );
+                                step_env
+                                    .insert("GITHUB_PATH".into(), "/github/workflow/path".into());
+                                step_env.insert(
+                                    "GITHUB_STEP_SUMMARY".into(),
+                                    "/github/workflow/step_summary".into(),
+                                );
+                            } else if let Some(github_parent) = github_dir.parent() {
                                 volumes.push((github_parent, github_parent));
                             }
                         }
                     }
+
+                    // Add container-defined volumes
+                    let mut owned_volume_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+                        Vec::new();
+                    if let Some(container_volumes) =
+                        ctx.container_config.and_then(|c| c.volumes.as_ref())
+                    {
+                        for vol_spec in container_volumes {
+                            let parts: Vec<&str> = vol_spec.splitn(2, ':').collect();
+                            if parts.len() == 2 {
+                                owned_volume_paths.push((
+                                    std::path::PathBuf::from(parts[0]),
+                                    std::path::PathBuf::from(parts[1]),
+                                ));
+                            }
+                        }
+                    }
+                    for (host, container) in &owned_volume_paths {
+                        volumes.push((host.as_path(), container.as_path()));
+                    }
+
+                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
+                    let env_vars: Vec<(&str, &str)> = step_env
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
 
                     let output = ctx
                         .runtime
@@ -1867,26 +1924,57 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // This handles quotes, pipes, redirections, and command substitutions correctly
         let cmd_parts = vec!["bash", "-c", &resolved_run];
 
-        // Convert environment variables to the required format
-        let env_vars: Vec<(&str, &str)> = step_env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
 
         // Set up volume mapping from host working dir to container workspace
         let mut volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
 
-        // Also mount the GitHub environment files directory if GITHUB_ENV is set
+        // Mount GitHub environment files directory and remap paths for container runtimes
+        let container_github_dir = Path::new("/github/workflow");
+        let is_container_runtime = step_env
+            .get("WRKFLW_RUNTIME_MODE")
+            .map(|m| m == "docker" || m == "podman")
+            .unwrap_or(false);
         if let Some(github_env_path) = ctx.job_env.get("GITHUB_ENV") {
             if let Some(github_dir) = Path::new(github_env_path).parent() {
-                if let Some(github_parent) = github_dir.parent() {
+                if is_container_runtime {
+                    volumes.push((github_dir, container_github_dir));
+                    step_env.insert("GITHUB_ENV".into(), "/github/workflow/env".into());
+                    step_env.insert("GITHUB_OUTPUT".into(), "/github/workflow/output".into());
+                    step_env.insert("GITHUB_PATH".into(), "/github/workflow/path".into());
+                    step_env.insert(
+                        "GITHUB_STEP_SUMMARY".into(),
+                        "/github/workflow/step_summary".into(),
+                    );
+                } else if let Some(github_parent) = github_dir.parent() {
                     volumes.push((github_parent, github_parent));
                 }
             }
         }
+
+        // Add container-defined volumes
+        let mut owned_volume_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        if let Some(container_volumes) = ctx.container_config.and_then(|c| c.volumes.as_ref()) {
+            for vol_spec in container_volumes {
+                let parts: Vec<&str> = vol_spec.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    owned_volume_paths.push((
+                        std::path::PathBuf::from(parts[0]),
+                        std::path::PathBuf::from(parts[1]),
+                    ));
+                }
+            }
+        }
+        for (host, container) in &owned_volume_paths {
+            volumes.push((host.as_path(), container.as_path()));
+        }
+
+        // Convert environment variables to the required format (after path remapping)
+        let env_vars: Vec<(&str, &str)> = step_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         // Execute the command
         match ctx
@@ -2188,6 +2276,14 @@ fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String {
         .map(|s| s.as_str())
         .unwrap_or(default);
     get_runner_image(ro)
+}
+
+fn get_effective_runner_image(job: &Job) -> String {
+    if let Some(ref container) = job.container {
+        container.image.clone()
+    } else {
+        get_runner_image_from_opt(&job.runs_on)
+    }
 }
 
 async fn execute_reusable_workflow_job(
@@ -2593,6 +2689,7 @@ async fn execute_composite_action(
                     matrix_combination: &None,
                     secret_manager: None, // Composite actions don't have secrets yet
                     secret_masker: None,
+                    container_config: None, // Composite actions don't use job containers
                 }))
                 .await?;
 
