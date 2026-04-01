@@ -338,8 +338,19 @@ async fn main() {
 
                 if validate_path.is_dir() {
                     // Validate all workflow files in the directory
-                    let entries = std::fs::read_dir(&validate_path)
-                        .expect("Failed to read directory")
+                    let rd = match std::fs::read_dir(&validate_path) {
+                        Ok(rd) => rd,
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to read directory {}: {}",
+                                validate_path.display(),
+                                e
+                            );
+                            validation_failed = true;
+                            continue;
+                        }
+                    };
+                    let entries = rd
                         .filter_map(|entry| entry.ok())
                         .filter(|entry| {
                             entry.path().is_file()
@@ -648,17 +659,22 @@ fn list_workflows_and_pipelines(verbose: bool) {
     if github_path.exists() && github_path.is_dir() {
         println!("GitHub Workflows:");
 
-        let entries = std::fs::read_dir(&github_path)
-            .expect("Failed to read directory")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.path().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|ext| ext == "yml" || ext == "yaml")
-            })
-            .collect::<Vec<_>>();
+        let entries = match std::fs::read_dir(&github_path) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!("Failed to read directory {}: {}", github_path.display(), e);
+                return;
+            }
+        }
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.path().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
+        .collect::<Vec<_>>();
 
         if entries.is_empty() {
             println!("  No workflow files found in .github/workflows");

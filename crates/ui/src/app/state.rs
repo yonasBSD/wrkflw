@@ -304,13 +304,10 @@ impl App {
     pub fn previous_job(&mut self) {
         let current_workflow_idx = self
             .current_execution
-            .or_else(|| self.workflow_list_state.selected());
+            .or_else(|| self.workflow_list_state.selected())
+            .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
-            if workflow_idx >= self.workflows.len() {
-                return;
-            }
-
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
                 if execution.jobs.is_empty() {
                     return;
@@ -342,10 +339,6 @@ impl App {
             .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
-            if workflow_idx >= self.workflows.len() {
-                return;
-            }
-
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
                 if execution.jobs.is_empty() {
                     return;

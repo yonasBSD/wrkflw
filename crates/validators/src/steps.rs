@@ -8,12 +8,12 @@ pub fn validate_steps(steps: &[Value], job_name: &str, result: &mut ValidationRe
 
     for (i, step) in steps.iter().enumerate() {
         if let Some(step_map) = step.as_mapping() {
-            if !step_map.contains_key(Value::String("name".to_string()))
-                && !step_map.contains_key(Value::String("uses".to_string()))
+            // A step must have either 'uses' or 'run' (name alone is not sufficient)
+            if !step_map.contains_key(Value::String("uses".to_string()))
                 && !step_map.contains_key(Value::String("run".to_string()))
             {
                 result.add_issue(format!(
-                    "Job '{}', step {}: Missing 'name', 'uses', or 'run' field",
+                    "Job '{}', step {}: Missing required 'uses' or 'run' field",
                     job_name,
                     i + 1
                 ));
@@ -53,5 +53,55 @@ pub fn validate_steps(steps: &[Value], job_name: &str, result: &mut ValidationRe
                 i + 1
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wrkflw_models::ValidationResult;
+
+    #[test]
+    fn test_step_with_only_name_is_invalid() {
+        let yaml = r#"
+- name: "just a name"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", &mut result);
+
+        assert!(!result.is_valid);
+        assert!(result
+            .issues
+            .iter()
+            .any(|i| i.contains("Missing required 'uses' or 'run' field")));
+    }
+
+    #[test]
+    fn test_step_with_run_is_valid() {
+        let yaml = r#"
+- name: "build"
+  run: "cargo build"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", &mut result);
+
+        assert!(result.is_valid);
+        assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn test_step_with_uses_is_valid() {
+        let yaml = r#"
+- name: "checkout"
+  uses: "actions/checkout@v4"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", &mut result);
+
+        assert!(result.is_valid);
+        assert!(result.issues.is_empty());
     }
 }

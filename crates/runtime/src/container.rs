@@ -25,6 +25,7 @@ pub trait ContainerRuntime {
 }
 
 #[derive(Debug)]
+#[must_use]
 pub struct ContainerOutput {
     pub stdout: String,
     pub stderr: String,

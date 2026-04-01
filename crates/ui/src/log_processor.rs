@@ -202,7 +202,7 @@ impl LogProcessor {
         // Extract timestamp from log format [HH:MM:SS]
         let timestamp = if log_line.starts_with('[') && log_line.contains(']') {
             let end = log_line.find(']').unwrap_or(0);
-            if end > 1 {
+            if end > 1 && log_line.is_char_boundary(1) && log_line.is_char_boundary(end) {
                 log_line[1..end].to_string()
             } else {
                 "??:??:??".to_string()
@@ -240,7 +240,11 @@ impl LogProcessor {
         // Extract content after timestamp
         let content = if log_line.starts_with('[') && log_line.contains(']') {
             let start = log_line.find(']').unwrap_or(0) + 1;
-            log_line[start..].trim()
+            if log_line.is_char_boundary(start) {
+                log_line[start..].trim()
+            } else {
+                log_line
+            }
         } else {
             log_line
         };
@@ -301,5 +305,26 @@ impl LogProcessor {
 impl Default for LogProcessor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multibyte_log_line_does_not_panic() {
+        // Emoji and multi-byte characters near bracket boundaries
+        let entry = LogProcessor::process_log_entry("[🚀] deployed service", "");
+        assert_eq!(entry.log_type, "INFO");
+
+        let entry2 = LogProcessor::process_log_entry("[ñ] latin char", "");
+        assert!(!entry2.timestamp.is_empty());
+    }
+
+    #[test]
+    fn test_normal_timestamp_extraction() {
+        let entry = LogProcessor::process_log_entry("[12:34:56] some log", "");
+        assert_eq!(entry.timestamp, "12:34:56");
     }
 }

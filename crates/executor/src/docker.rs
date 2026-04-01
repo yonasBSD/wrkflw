@@ -1009,10 +1009,15 @@ impl DockerRuntime {
         };
 
         // Get logs with a timeout
+        let log_options = Some(bollard::container::LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            ..Default::default()
+        });
         let logs_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.docker
-                .logs::<String>(&container.id, None)
+                .logs(&container.id, log_options)
                 .collect::<Vec<_>>(),
         )
         .await;
@@ -1112,10 +1117,10 @@ impl DockerRuntime {
                             e
                         ))
                     })?
-                    .elapsed()
+                    .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| {
                         ContainerError::ContainerExecution(format!(
-                            "Failed to get elapsed time since modification: {}",
+                            "Failed to convert modification time to Unix timestamp: {}",
                             e
                         ))
                     })?
