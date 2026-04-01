@@ -338,7 +338,7 @@ async fn main() {
 
                 if validate_path.is_dir() {
                     // Validate all workflow files in the directory
-                    let entries = match std::fs::read_dir(&validate_path) {
+                    let rd = match std::fs::read_dir(&validate_path) {
                         Ok(rd) => rd,
                         Err(e) => {
                             eprintln!(
@@ -346,18 +346,20 @@ async fn main() {
                                 validate_path.display(),
                                 e
                             );
-                            std::process::exit(1);
+                            validation_failed = true;
+                            continue;
                         }
-                    }
-                    .filter_map(|entry| entry.ok())
-                    .filter(|entry| {
-                        entry.path().is_file()
-                            && entry
-                                .path()
-                                .extension()
-                                .is_some_and(|ext| ext == "yml" || ext == "yaml")
-                    })
-                    .collect::<Vec<_>>();
+                    };
+                    let entries = rd
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| {
+                            entry.path().is_file()
+                                && entry
+                                    .path()
+                                    .extension()
+                                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
+                        })
+                        .collect::<Vec<_>>();
 
                     println!(
                         "Validating {} workflow file(s) in {}...",
