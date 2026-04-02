@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use wrkflw_logging;
-use wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use wrkflw_runtime::container::{
+    ContainerError, ContainerOutput, ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
+};
 use wrkflw_utils;
 use wrkflw_utils::fd;
 
@@ -684,8 +686,16 @@ impl ContainerRuntime for DockerRuntime {
         tag: &str,
         context_dir: &Path,
     ) -> Result<(), ContainerError> {
-        // Add a timeout for build operations
-        let timeout_duration = std::time::Duration::from_secs(120); // 2 minutes timeout for builds
+        // Add a timeout for build operations.
+        // Combined runtime images may need to install packages from PPAs
+        // and external sources, so allow up to 10 minutes.
+        // Other builds use a 2 minute timeout.
+        let timeout_secs = if tag.starts_with(COMBINED_IMAGE_PREFIX) {
+            600
+        } else {
+            120
+        };
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
         match tokio::time::timeout(
             timeout_duration,
@@ -696,8 +706,9 @@ impl ContainerRuntime for DockerRuntime {
             Ok(result) => result,
             Err(_) => {
                 wrkflw_logging::error(&format!(
-                    "Building image {} timed out after 120 seconds",
-                    tag
+                    "Building image {} timed out after {} seconds",
+                    tag,
+                    timeout_duration.as_secs()
                 ));
                 Err(ContainerError::ImageBuild(
                     "Operation timed out".to_string(),
@@ -840,6 +851,19 @@ impl ContainerRuntime for DockerRuntime {
 
         Ok(image_tag)
     }
+
+    async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
+        match self.docker.inspect_image(tag).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(ContainerError::ImageBuild(format!(
+                "Failed to inspect image {}: {}",
+                tag, e
+            ))),
+        }
+    }
 }
 
 // Move the actual implementation to internal methods
@@ -853,12 +877,15 @@ impl DockerRuntime {
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
-        // First, try to pull the image if it's not available locally
-        if let Err(e) = self.pull_image_inner(image).await {
-            wrkflw_logging::warning(&format!(
-                "Failed to pull image {}: {}. Attempting to continue with existing image.",
-                image, e
-            ));
+        // Try to pull the image if it's not available locally.
+        // Skip pull for locally-built images (e.g., combined runtime images).
+        if !image.starts_with(LOCAL_IMAGE_PREFIX) {
+            if let Err(e) = self.pull_image_inner(image).await {
+                wrkflw_logging::warning(&format!(
+                    "Failed to pull image {}: {}. Attempting to continue with existing image.",
+                    image, e
+                ));
+            }
         }
 
         // Collect environment variables

