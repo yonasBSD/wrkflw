@@ -85,6 +85,14 @@ async fn execute_github_workflow(
     // 2. Resolve job dependencies and create execution plan
     let execution_plan = dependency::resolve_dependencies(&workflow)?;
 
+    // Filter to target job and its transitive dependencies if specified
+    let execution_plan = if let Some(ref target_job) = config.target_job {
+        dependency::filter_plan_to_job(execution_plan, target_job, &workflow.jobs, "workflow")
+            .map_err(ExecutionError::Execution)?
+    } else {
+        execution_plan
+    };
+
     // 3. Initialize appropriate runtime
     let runtime = initialize_runtime(
         config.runtime_type.clone(),
@@ -212,6 +220,20 @@ async fn execute_gitlab_pipeline(
 
     // 3. Resolve job dependencies based on stages
     let execution_plan = resolve_gitlab_dependencies(&pipeline, &workflow)?;
+
+    // Filter to target job and its stage-based dependencies if specified.
+    // GitLab uses stages for implicit ordering, so we keep all earlier stages.
+    let execution_plan = if let Some(ref target_job) = config.target_job {
+        dependency::filter_plan_to_job_by_stage(
+            execution_plan,
+            target_job,
+            &workflow.jobs,
+            "pipeline",
+        )
+        .map_err(ExecutionError::Execution)?
+    } else {
+        execution_plan
+    };
 
     // 4. Initialize appropriate runtime
     let runtime = initialize_runtime(
@@ -477,6 +499,7 @@ pub struct ExecutionConfig {
     pub preserve_containers_on_failure: bool,
     pub secrets_config: Option<SecretConfig>,
     pub show_action_messages: bool,
+    pub target_job: Option<String>,
 }
 
 pub struct ExecutionResult {
