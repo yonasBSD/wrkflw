@@ -391,7 +391,7 @@ pub fn start_next_workflow_execution(
     tx_clone: &mpsc::Sender<ExecutionResultMsg>,
     verbose: bool,
 ) {
-    if let Some(next_idx) = app.get_next_workflow_to_execute() {
+    if let Some((next_idx, target_job)) = app.get_next_workflow_to_execute() {
         app.current_execution = Some(next_idx);
         let tx_clone_inner = tx_clone.clone();
         let workflow_path = app.workflows[next_idx].path.clone();
@@ -544,7 +544,7 @@ pub fn start_next_workflow_execution(
                         preserve_containers_on_failure,
                         secrets_config: None, // Use default secrets configuration
                         show_action_messages,
-                        target_job: None,
+                        target_job,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

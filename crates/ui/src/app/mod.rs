@@ -2,7 +2,7 @@
 mod state;
 
 use crate::handlers::workflow::start_next_workflow_execution;
-use crate::models::{ExecutionResultMsg, Workflow, WorkflowStatus};
+use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus};
 use crate::utils::load_workflows;
 use crate::views::render_ui;
 use chrono::Local;
@@ -66,16 +66,22 @@ pub async fn run_wrkflw_tui(
                 .to_string_lossy()
                 .into_owned();
 
+            let job_names = crate::utils::extract_job_names(path);
+
             app.workflows = vec![Workflow {
                 name: name.clone(),
                 path: path.clone(),
                 selected: true,
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
+                job_names,
             }];
 
             // Queue the single workflow for execution
-            app.execution_queue = vec![0];
+            app.execution_queue = vec![QueuedExecution {
+                workflow_idx: 0,
+                target_job: None,
+            }];
             app.start_execution();
 
             // Return parent dir or current dir if no parent
@@ -221,7 +227,9 @@ fn run_tui_event_loop(
                         break Ok(());
                     }
                     KeyCode::Esc => {
-                        if app.detailed_view {
+                        if app.job_selection_mode {
+                            app.exit_job_selection_mode();
+                        } else if app.detailed_view {
                             app.detailed_view = false;
                         } else if app.show_help {
                             app.show_help = false;
@@ -252,7 +260,11 @@ fn run_tui_event_loop(
                         } else if app.selected_tab == 3 {
                             app.scroll_help_up();
                         } else if app.selected_tab == 0 {
-                            app.previous_workflow();
+                            if app.job_selection_mode {
+                                app.previous_available_job();
+                            } else {
+                                app.previous_workflow();
+                            }
                         } else if app.selected_tab == 1 {
                             if app.detailed_view {
                                 app.previous_step();
@@ -271,7 +283,11 @@ fn run_tui_event_loop(
                         } else if app.selected_tab == 3 {
                             app.scroll_help_down();
                         } else if app.selected_tab == 0 {
-                            app.next_workflow();
+                            if app.job_selection_mode {
+                                app.next_available_job();
+                            } else {
+                                app.next_workflow();
+                            }
                         } else if app.selected_tab == 1 {
                             if app.detailed_view {
                                 app.next_step();
@@ -281,19 +297,30 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if app.selected_tab == 0 && !app.running {
+                        if app.selected_tab == 0 && !app.running && !app.job_selection_mode {
                             app.toggle_selected();
                         }
                     }
                     KeyCode::Enter => {
                         match app.selected_tab {
                             0 => {
-                                // In workflows tab, Enter runs the selected workflow
                                 if !app.running {
-                                    if let Some(idx) = app.workflow_list_state.selected() {
-                                        app.workflows[idx].selected = true;
-                                        app.queue_selected_for_execution();
-                                        app.start_execution();
+                                    if app.job_selection_mode {
+                                        // In job selection mode, run the selected job
+                                        if app.selected_job_index < app.available_jobs.len() {
+                                            let job_name =
+                                                app.available_jobs[app.selected_job_index].clone();
+                                            app.run_from_job_selection(Some(job_name));
+                                        }
+                                    } else {
+                                        // Run the selected workflow directly
+                                        if let Some(idx) = app.workflow_list_state.selected() {
+                                            if idx < app.workflows.len() {
+                                                app.workflows[idx].selected = true;
+                                                app.queue_selected_for_execution();
+                                                app.start_execution();
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -329,17 +356,28 @@ fn run_tui_event_loop(
                                     render_ui(f, app);
                                 })?;
                             }
-                        } else if !app.running {
+                        } else if !app.running && !app.job_selection_mode {
                             app.queue_selected_for_execution();
                             app.start_execution();
                         }
                     }
                     KeyCode::Char('a') => {
                         if !app.running {
-                            // Select all workflows
-                            for workflow in &mut app.workflows {
-                                workflow.selected = true;
+                            if app.job_selection_mode {
+                                // In job selection mode, run all jobs
+                                app.run_from_job_selection(None);
+                            } else {
+                                // Select all workflows
+                                for workflow in &mut app.workflows {
+                                    workflow.selected = true;
+                                }
                             }
+                        }
+                    }
+                    KeyCode::Char('J') => {
+                        // Enter job selection mode for selected workflow
+                        if !app.running && app.selected_tab == 0 && !app.job_selection_mode {
+                            app.enter_job_selection_mode();
                         }
                     }
                     KeyCode::Char('e') => {
