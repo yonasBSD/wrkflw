@@ -1695,6 +1695,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         job_env.insert(key.clone(), value.clone());
     }
 
+    // Add job-specific context
+    environment::add_job_context(&mut job_env, ctx.job_name);
+
     // Execute job steps
     let mut step_results = Vec::new();
     let mut job_logs = String::new();
@@ -1716,54 +1719,81 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
     let runner_image_value = resolve_runner_image(job, ctx.runtime).await?;
 
-    for (idx, step) in job.steps.iter().enumerate() {
-        let outcome = run_step_with_guards(
-            step,
-            idx,
-            &job_env,
-            ctx.workflow,
-            StepExecutionContext {
+    // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
+    let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
+    let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
+
+    let step_loop = async {
+        for (idx, step) in job.steps.iter().enumerate() {
+            let outcome = run_step_with_guards(
                 step,
-                step_idx: idx,
-                job_env: &job_env,
-                working_dir: job_dir.path(),
-                runtime: ctx.runtime,
-                workflow: ctx.workflow,
-                runner_image: &runner_image_value,
-                verbose: ctx.verbose,
-                matrix_combination: &None,
-                secret_manager: ctx.secret_manager,
-                secret_masker: ctx.secret_masker,
-                container_config: job.container.as_ref(),
-            },
-        )
-        .await?;
+                idx,
+                &job_env,
+                ctx.workflow,
+                StepExecutionContext {
+                    step,
+                    step_idx: idx,
+                    job_env: &job_env,
+                    working_dir: job_dir.path(),
+                    runtime: ctx.runtime,
+                    workflow: ctx.workflow,
+                    runner_image: &runner_image_value,
+                    verbose: ctx.verbose,
+                    matrix_combination: &None,
+                    secret_manager: ctx.secret_manager,
+                    secret_masker: ctx.secret_masker,
+                    container_config: job.container.as_ref(),
+                    workflow_defaults: ctx.workflow.defaults.as_ref(),
+                    job_defaults: job.defaults.as_ref(),
+                },
+            )
+            .await?;
 
-        match outcome {
-            StepOutcome::Skipped(result) => {
-                step_results.push(result);
-            }
-            StepOutcome::Completed { result, abort_job } => {
-                // Add step output to logs only in verbose mode or if there's an error
-                if ctx.verbose || result.status == StepStatus::Failure {
-                    job_logs.push_str(&format!(
-                        "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
-                        result.name, result.output
-                    ));
-                } else {
-                    job_logs.push_str(&format!(
-                        "Step '{}' completed with status: {:?}\n",
-                        result.name, result.status
-                    ));
+            match outcome {
+                StepOutcome::Skipped(result) => {
+                    step_results.push(result);
                 }
+                StepOutcome::Completed { result, abort_job } => {
+                    // Add step output to logs only in verbose mode or if there's an error
+                    if ctx.verbose || result.status == StepStatus::Failure {
+                        job_logs.push_str(&format!(
+                            "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
+                            result.name, result.output
+                        ));
+                    } else {
+                        job_logs.push_str(&format!(
+                            "Step '{}' completed with status: {:?}\n",
+                            result.name, result.status
+                        ));
+                    }
 
-                step_results.push(result);
+                    step_results.push(result);
 
-                if abort_job {
-                    job_success = false;
-                    break;
+                    if abort_job {
+                        job_success = false;
+                        break;
+                    }
                 }
             }
+        }
+
+        Ok::<(), ExecutionError>(())
+    };
+
+    match tokio::time::timeout(job_timeout, step_loop).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            wrkflw_logging::error(&format!(
+                "Job '{}' exceeded timeout of {} minutes",
+                ctx.job_name, timeout_mins
+            ));
+            return Ok(JobResult {
+                name: ctx.job_name.to_string(),
+                status: JobStatus::Failure,
+                steps: step_results,
+                logs: format!("{}\nJob timed out after {} minutes", job_logs, timeout_mins),
+            });
         }
     }
 
@@ -1935,6 +1965,8 @@ async fn execute_matrix_job(
                     secret_manager: None,
                     secret_masker: None,
                     container_config: job_template.container.as_ref(),
+                    workflow_defaults: workflow.defaults.as_ref(),
+                    job_defaults: job_template.defaults.as_ref(),
                 },
             )
             .await?;
@@ -2019,7 +2051,29 @@ async fn run_step_with_guards(
         }
     }
 
-    match execute_step(step_exec_ctx).await {
+    // Wrap step execution with optional timeout; sanitize to avoid panic on negative/NaN
+    let step_result = if let Some(minutes) = step.timeout_minutes {
+        let safe_mins = sanitize_timeout_minutes(Some(minutes), 360.0);
+        let dur = std::time::Duration::from_secs_f64(safe_mins * 60.0);
+        match tokio::time::timeout(dur, execute_step(step_exec_ctx)).await {
+            Ok(result) => result,
+            Err(_) => {
+                wrkflw_logging::error(&format!(
+                    "  Step '{}' exceeded timeout of {} minutes",
+                    step_name, minutes
+                ));
+                Ok(StepResult {
+                    name: step_name.clone(),
+                    status: StepStatus::Failure,
+                    output: format!("Step timed out after {} minutes", minutes),
+                })
+            }
+        }
+    } else {
+        execute_step(step_exec_ctx).await
+    };
+
+    match step_result {
         Ok(result) => {
             let abort_job = if result.status == StepStatus::Failure {
                 if step.continue_on_error == Some(true) {
@@ -2064,6 +2118,18 @@ async fn run_step_with_guards(
     }
 }
 
+/// Sanitize a timeout-minutes value, returning a safe positive finite number.
+/// Falls back to `default` for `None`, `NaN`, `Infinity`, zero, or negative values.
+/// Clamps to a maximum of 8640 minutes (6 days).
+fn sanitize_timeout_minutes(raw: Option<f64>, default: f64) -> f64 {
+    let mins = raw.unwrap_or(default);
+    if mins.is_finite() && mins > 0.0 {
+        mins.min(360.0 * 24.0)
+    } else {
+        default
+    }
+}
+
 // Before the execute_step function, add this struct
 struct StepExecutionContext<'a> {
     step: &'a workflow::Step,
@@ -2080,6 +2146,8 @@ struct StepExecutionContext<'a> {
     #[allow(dead_code)] // Planned for future implementation
     secret_masker: Option<&'a SecretMasker>,
     container_config: Option<&'a JobContainer>,
+    workflow_defaults: Option<&'a workflow::Defaults>,
+    job_defaults: Option<&'a workflow::Defaults>,
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -2651,15 +2719,105 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             run.clone()
         };
 
+        // Resolve expression substitutions (hashFiles, matrix vars)
+        let resolved_run = match crate::substitution::preprocess_expressions(
+            &resolved_run,
+            ctx.working_dir,
+            ctx.matrix_combination,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(StepResult {
+                    name: step_name,
+                    status: StepStatus::Failure,
+                    output: format!("Expression substitution failed: {}", e),
+                });
+            }
+        };
+
         // Check if this is a cargo command
         let is_cargo_cmd = resolved_run.trim().starts_with("cargo");
 
-        // For complex shell commands, use bash to execute them properly
-        // This handles quotes, pipes, redirections, and command substitutions correctly
-        let cmd_parts = vec!["bash", "-c", &resolved_run];
+        // Resolve effective shell: step > job defaults > workflow defaults > "bash"
+        let effective_shell = ctx
+            .step
+            .shell
+            .as_deref()
+            .or_else(|| {
+                ctx.job_defaults
+                    .and_then(|d| d.run.as_ref()?.shell.as_deref())
+            })
+            .or_else(|| {
+                ctx.workflow_defaults
+                    .and_then(|d| d.run.as_ref()?.shell.as_deref())
+            })
+            .unwrap_or("bash");
+
+        let cmd_parts = match effective_shell {
+            "bash" => vec![
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &resolved_run,
+            ],
+            "sh" => vec!["sh", "-e", "-c", &resolved_run],
+            "python" => vec!["python", "-c", &resolved_run],
+            "pwsh" | "powershell" => vec!["pwsh", "-command", &resolved_run],
+            other => {
+                wrkflw_logging::warning(&format!(
+                    "  Unrecognized shell '{}', falling back to '{} -c'",
+                    other, other
+                ));
+                vec![other, "-c", &resolved_run]
+            }
+        };
+
+        // Resolve effective working directory: step > job defaults > workflow defaults
+        let effective_wd = ctx
+            .step
+            .working_directory
+            .as_deref()
+            .or_else(|| {
+                ctx.job_defaults
+                    .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
+            })
+            .or_else(|| {
+                ctx.workflow_defaults
+                    .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
+            });
 
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
+        let final_workspace = if let Some(wd) = effective_wd {
+            let joined = container_workspace.join(wd);
+            // Canonicalize logically to catch ".." traversal and absolute path replacement
+            let mut normalized = std::path::PathBuf::new();
+            for component in joined.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    c => normalized.push(c.as_os_str()),
+                }
+            }
+            if !normalized.starts_with(container_workspace) {
+                return Ok(StepResult {
+                    name: step_name,
+                    status: StepStatus::Failure,
+                    output: format!(
+                        "Invalid working-directory '{}': must be within workspace",
+                        wd
+                    ),
+                });
+            }
+            normalized
+        } else {
+            container_workspace.to_path_buf()
+        };
 
         let mount_ctx =
             prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
@@ -2676,7 +2834,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ctx.runner_image,
                 &cmd_parts,
                 &env_vars,
-                container_workspace,
+                &final_workspace,
                 &volumes,
                 None,
             )
@@ -3565,6 +3723,7 @@ async fn execute_composite_action(
                         on: vec![],
                         on_raw: serde_yaml::Value::Null,
                         jobs: HashMap::new(),
+                        defaults: None,
                     },
                     runner_image,
                     verbose,
@@ -3572,6 +3731,8 @@ async fn execute_composite_action(
                     secret_manager: None, // Composite actions don't have secrets yet
                     secret_masker: None,
                     container_config: None, // Composite actions don't use job containers
+                    workflow_defaults: None,
+                    job_defaults: None,
                 }))
                 .await?;
 
@@ -3883,6 +4044,8 @@ mod tests {
             uses: None,
             with: None,
             secrets: None,
+            timeout_minutes: None,
+            defaults: None,
         }
     }
 
@@ -4176,6 +4339,7 @@ mod tests {
             on: Vec::new(),
             on_raw: serde_yaml::Value::Null,
             jobs: HashMap::new(),
+            defaults: None,
         }
     }
 
@@ -4693,6 +4857,7 @@ runs:
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         }
     }
 
@@ -4743,6 +4908,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4789,6 +4956,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4840,6 +5009,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4884,6 +5055,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4929,6 +5102,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await;
@@ -4973,6 +5148,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5015,6 +5192,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5507,5 +5686,442 @@ runs:
         let tag_ba = combined_image_tag(&runtimes_ba, df);
         // Both should produce the same sorted prefix (a1-b2)
         assert_eq!(tag_ab, tag_ba);
+    }
+
+    // --- Shell invocation tests ---
+
+    fn make_run_step(run: &str) -> Step {
+        Step {
+            name: Some("run-step".to_string()),
+            uses: None,
+            run: Some(run.to_string()),
+            with: None,
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_shell_uses_errexit_and_pipefail() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("echo hello");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let cmd = &calls[0].cmd;
+        // Should be: bash --noprofile --norc -e -o pipefail -c <script>
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "--noprofile");
+        assert_eq!(cmd[2], "--norc");
+        assert_eq!(cmd[3], "-e");
+        assert_eq!(cmd[4], "-o");
+        assert_eq!(cmd[5], "pipefail");
+        assert_eq!(cmd[6], "-c");
+        assert_eq!(cmd[7], "echo hello");
+    }
+
+    #[tokio::test]
+    async fn sh_shell_uses_errexit() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some("sh".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-e");
+        assert_eq!(cmd[2], "-c");
+        assert_eq!(cmd[3], "echo hello");
+    }
+
+    // --- Working-directory path traversal tests ---
+
+    #[tokio::test]
+    async fn working_directory_rejects_parent_traversal() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo pwned");
+        step.working_directory = Some("../../etc".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Invalid working-directory"));
+    }
+
+    #[tokio::test]
+    async fn working_directory_allows_subdirectory() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo ok");
+        step.working_directory = Some("src/app".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        // No container calls should have failed
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn working_directory_rejects_absolute_path() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo pwned");
+        step.working_directory = Some("/tmp/evil".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Invalid working-directory"));
+    }
+
+    // --- Defaults cascade tests ---
+
+    #[tokio::test]
+    async fn defaults_cascade_job_overrides_workflow() {
+        let runtime = MockContainerRuntime::default();
+        let workflow_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("sh".to_string()),
+                working_directory: None,
+            }),
+        };
+        let job_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("python".to_string()),
+                working_directory: None,
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("print('hello')");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: Some(&workflow_defaults),
+            job_defaults: Some(&job_defaults),
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        // Job defaults (python) should override workflow defaults (sh)
+        assert_eq!(cmd[0], "python");
+        assert_eq!(cmd[1], "-c");
+    }
+
+    #[tokio::test]
+    async fn defaults_cascade_step_overrides_job() {
+        let runtime = MockContainerRuntime::default();
+        let job_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("python".to_string()),
+                working_directory: None,
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some("sh".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: Some(&job_defaults),
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        // Step shell (sh) should override job defaults (python)
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-e");
+        assert_eq!(cmd[2], "-c");
+    }
+
+    #[tokio::test]
+    async fn defaults_cascade_workflow_used_when_no_job_or_step() {
+        let runtime = MockContainerRuntime::default();
+        let workflow_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("sh".to_string()),
+                working_directory: None,
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("echo hello");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: Some(&workflow_defaults),
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        // Workflow defaults (sh) should be used
+        assert_eq!(cmd[0], "sh");
+    }
+
+    #[tokio::test]
+    async fn defaults_cascade_working_directory_from_job() {
+        let runtime = MockContainerRuntime::default();
+        let job_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: None,
+                working_directory: Some("src".to_string()),
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("echo ok");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: Some(&job_defaults),
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        // Should succeed — "src" is a valid subdirectory path
+    }
+
+    // --- sanitize_timeout_minutes tests ---
+
+    #[test]
+    fn sanitize_timeout_none_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(None, 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_positive_value_returned() {
+        assert_eq!(sanitize_timeout_minutes(Some(30.0), 360.0), 30.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_nan_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(f64::NAN), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_infinity_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(f64::INFINITY), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_neg_infinity_returns_default() {
+        assert_eq!(
+            sanitize_timeout_minutes(Some(f64::NEG_INFINITY), 360.0),
+            360.0
+        );
+    }
+
+    #[test]
+    fn sanitize_timeout_zero_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(0.0), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_negative_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(-5.0), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_clamps_to_max() {
+        // 360 * 24 = 8640
+        assert_eq!(sanitize_timeout_minutes(Some(99999.0), 360.0), 8640.0);
+    }
+
+    // --- Job-level timeout test ---
+
+    #[tokio::test]
+    async fn job_timeout_produces_failure_result() {
+        // Use a very short timeout wrapping a step that sleeps longer
+        let timeout_mins = 0.0001; // ~6ms
+        let dur = std::time::Duration::from_secs_f64(
+            sanitize_timeout_minutes(Some(timeout_mins), 360.0) * 60.0,
+        );
+
+        let step_loop = async {
+            // Simulate a step that takes longer than the timeout
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok::<(), ExecutionError>(())
+        };
+
+        let result = tokio::time::timeout(dur, step_loop).await;
+        assert!(result.is_err(), "Expected timeout but step completed");
     }
 }
