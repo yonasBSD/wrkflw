@@ -10,12 +10,10 @@ lazy_static! {
         Regex::new(r"\$\{\{\s*matrix\.([a-zA-Z0-9_]+)\s*\}\}").unwrap();
     static ref HASH_FILES_PATTERN: Regex =
         Regex::new(r"\$\{\{\s*hashFiles\(([^)]+)\)\s*\}\}").unwrap();
-    static ref STEPS_OUTPUT_PATTERN: Regex = Regex::new(
-        r"\$\{\{\s*steps\.([a-zA-Z_][a-zA-Z0-9_-]*)\.outputs\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\}\}"
-    )
-    .unwrap();
-    static ref ENV_CONTEXT_PATTERN: Regex =
-        Regex::new(r"\$\{\{\s*env\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}").unwrap();
+    /// Matches any `${{ ... }}` expression. Handles single `}` inside format
+    /// placeholders like `{0}` by requiring the closing `}}` pair.
+    static ref EXPRESSION_PATTERN: Regex =
+        Regex::new(r"\$\{\{(?:[^}]|\}[^}])*\}\}").unwrap();
 }
 
 /// Preprocesses a command string to replace GitHub-style matrix variable references
@@ -56,38 +54,6 @@ pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, V
             })
             .to_string()
     }
-}
-
-/// Replace `${{ steps.<id>.outputs.<key> }}` with the corresponding step output value.
-///
-/// Missing step IDs or output keys resolve to an empty string, matching GitHub Actions behavior.
-pub fn preprocess_step_outputs(
-    text: &str,
-    step_outputs: &HashMap<String, HashMap<String, String>>,
-) -> String {
-    STEPS_OUTPUT_PATTERN
-        .replace_all(text, |caps: &regex::Captures| {
-            let step_id = &caps[1];
-            let output_key = &caps[2];
-            step_outputs
-                .get(step_id)
-                .and_then(|m| m.get(output_key))
-                .cloned()
-                .unwrap_or_default()
-        })
-        .into_owned()
-}
-
-/// Replace `${{ env.<name> }}` with the value of the environment variable.
-///
-/// Missing variables resolve to an empty string, matching GitHub Actions behavior.
-pub fn preprocess_env_context(text: &str, env: &HashMap<String, String>) -> String {
-    ENV_CONTEXT_PATTERN
-        .replace_all(text, |caps: &regex::Captures| {
-            let var_name = &caps[1];
-            env.get(var_name).cloned().unwrap_or_default()
-        })
-        .into_owned()
 }
 
 /// Replace `${{ hashFiles(...) }}` expressions with the SHA-256 hash of matched files.
@@ -182,7 +148,15 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Apply all expression substitutions: hashFiles, step outputs, env context, matrix variables.
+/// Apply all expression substitutions to a text string.
+///
+/// `hashFiles()` is resolved first (needs filesystem access), then all remaining
+/// `${{ ... }}` expressions are evaluated through the expression evaluator which
+/// handles env, inputs, github, runner, matrix, and steps contexts as well as
+/// operators and built-in functions.
+///
+/// Expressions that fail evaluation are replaced with empty string as a safety
+/// fallback, matching GitHub Actions behavior.
 ///
 /// Returns `Err` if a `hashFiles()` expression fails (e.g. unreadable file).
 pub fn preprocess_expressions(
@@ -192,22 +166,39 @@ pub fn preprocess_expressions(
     step_outputs: &HashMap<String, HashMap<String, String>>,
     env_context: &HashMap<String, String>,
 ) -> Result<String, String> {
-    // Resolve hashFiles first (needs filesystem access)
+    use crate::expression::{evaluate, ExpressionContext};
+
+    // Resolve hashFiles first (needs filesystem access not available in the
+    // expression evaluator)
     let result = preprocess_hash_files(text, workspace)?;
-    // Then resolve step outputs and env context
-    let result = preprocess_step_outputs(&result, step_outputs);
-    let result = preprocess_env_context(&result, env_context);
-    // Finally resolve matrix variables
-    Ok(if let Some(matrix) = matrix_combination {
-        preprocess_command(&result, matrix)
-    } else {
-        MATRIX_PATTERN
-            .replace_all(&result, |caps: &regex::Captures| {
-                let var_name = &caps[1];
-                format!("\\${{{{ matrix.{} }}}}", var_name)
-            })
-            .to_string()
-    })
+
+    let ctx = ExpressionContext {
+        env_context,
+        step_outputs,
+        matrix_combination,
+    };
+
+    // Evaluate all remaining ${{ ... }} expressions through the expression evaluator
+    let result = EXPRESSION_PATTERN
+        .replace_all(&result, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            // Extract the inner expression (strip "${{" and "}}")
+            let inner = &full_match[3..full_match.len() - 2];
+            match evaluate(inner, &ctx) {
+                Ok(val) => val.to_output_string(),
+                Err(e) => {
+                    wrkflw_logging::debug(&format!(
+                        "Expression evaluation failed for '{}': {} — substituting empty string",
+                        inner.trim(),
+                        e
+                    ));
+                    String::new()
+                }
+            }
+        })
+        .into_owned();
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -390,55 +381,73 @@ mod tests {
         assert!(result.unwrap_err().contains("path traversal"));
     }
 
+    // -- step outputs via expression evaluator --
+
     #[test]
     fn step_output_substitution() {
+        let dir = tempdir().unwrap();
         let mut step_outputs = HashMap::new();
         let mut build_outputs = HashMap::new();
         build_outputs.insert("version".to_string(), "1.2.3".to_string());
         step_outputs.insert("build".to_string(), build_outputs);
 
         let text = "Version is ${{ steps.build.outputs.version }}";
-        let result = preprocess_step_outputs(text, &step_outputs);
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &step_outputs, &HashMap::new())
+                .unwrap();
         assert_eq!(result, "Version is 1.2.3");
     }
 
     #[test]
     fn step_output_missing_returns_empty() {
-        let step_outputs = HashMap::new();
+        let dir = tempdir().unwrap();
 
         let text = "Value: ${{ steps.unknown.outputs.key }}";
-        let result = preprocess_step_outputs(text, &step_outputs);
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
+                .unwrap();
         assert_eq!(result, "Value: ");
     }
 
     #[test]
     fn step_output_missing_key_returns_empty() {
+        let dir = tempdir().unwrap();
         let mut step_outputs = HashMap::new();
         step_outputs.insert("build".to_string(), HashMap::new());
 
         let text = "${{ steps.build.outputs.missing }}";
-        let result = preprocess_step_outputs(text, &step_outputs);
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &step_outputs, &HashMap::new())
+                .unwrap();
         assert_eq!(result, "");
     }
 
+    // -- env context via expression evaluator --
+
     #[test]
     fn env_context_substitution() {
+        let dir = tempdir().unwrap();
         let mut env = HashMap::new();
         env.insert("MY_VAR".to_string(), "hello".to_string());
 
         let text = "Value: ${{ env.MY_VAR }}";
-        let result = preprocess_env_context(text, &env);
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
         assert_eq!(result, "Value: hello");
     }
 
     #[test]
     fn env_context_missing_returns_empty() {
-        let env = HashMap::new();
+        let dir = tempdir().unwrap();
 
         let text = "${{ env.MISSING }}";
-        let result = preprocess_env_context(text, &env);
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
+                .unwrap();
         assert_eq!(result, "");
     }
+
+    // -- combined contexts --
 
     #[test]
     fn combined_substitutions() {
@@ -460,5 +469,176 @@ mod tests {
         let result =
             preprocess_expressions(text, dir.path(), &Some(matrix), &step_outputs, &env).unwrap();
         assert_eq!(result, "ubuntu-v1-true");
+    }
+
+    // -- inputs context via expression evaluator --
+
+    #[test]
+    fn inputs_context_substitution() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("INPUT_TOOLCHAIN".to_string(), "stable".to_string());
+        env.insert("INPUT_COMPONENTS".to_string(), "rustfmt".to_string());
+
+        let text =
+            "rustup toolchain install ${{ inputs.toolchain }} --component ${{ inputs.components }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        assert_eq!(
+            result,
+            "rustup toolchain install stable --component rustfmt"
+        );
+    }
+
+    #[test]
+    fn inputs_context_hyphenated_name() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("INPUT_NODE_VERSION".to_string(), "18".to_string());
+
+        let text = "${{ inputs.node-version }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        assert_eq!(result, "18");
+    }
+
+    #[test]
+    fn inputs_context_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+
+        let text = "${{ inputs.missing }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
+                .unwrap();
+        assert_eq!(result, "");
+    }
+
+    // -- github context via expression evaluator --
+
+    #[test]
+    fn github_context_substitution() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("GITHUB_REPOSITORY".to_string(), "owner/repo".to_string());
+        env.insert("GITHUB_REF_NAME".to_string(), "main".to_string());
+
+        let text = "${{ github.repository }}/${{ github.ref_name }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        assert_eq!(result, "owner/repo/main");
+    }
+
+    #[test]
+    fn github_context_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+
+        let text = "${{ github.token }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
+                .unwrap();
+        assert_eq!(result, "");
+    }
+
+    // -- runner context via expression evaluator --
+
+    #[test]
+    fn runner_context_substitution() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        env.insert("RUNNER_TEMP".to_string(), "/tmp/runner".to_string());
+
+        let text = "${{ runner.os }} ${{ runner.temp }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        assert_eq!(result, "Linux /tmp/runner");
+    }
+
+    #[test]
+    fn runner_context_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+
+        let text = "${{ runner.arch }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
+                .unwrap();
+        assert_eq!(result, "");
+    }
+
+    // -- all contexts via preprocess_expressions --
+
+    #[test]
+    fn preprocess_expressions_includes_inputs_and_github() {
+        let dir = tempdir().unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("INPUT_TOOLCHAIN".to_string(), "nightly".to_string());
+        env.insert("GITHUB_REPOSITORY".to_string(), "foo/bar".to_string());
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+
+        let text = "${{ inputs.toolchain }}-${{ github.repository }}-${{ runner.os }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        assert_eq!(result, "nightly-foo/bar-Linux");
+    }
+
+    #[test]
+    fn preprocess_expressions_unknown_context_returns_empty() {
+        let dir = tempdir().unwrap();
+
+        let text = "echo ${{ unknown_context.value }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
+                .unwrap();
+        assert_eq!(result, "echo ");
+    }
+
+    // -- complex expressions --
+
+    #[test]
+    fn preprocess_expressions_evaluates_complex_expression() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("INPUT_COMPONENTS".to_string(), "rustfmt".to_string());
+
+        let mut step_outputs = HashMap::new();
+        let mut parse_out = HashMap::new();
+        parse_out.insert("toolchain".to_string(), "nightly".to_string());
+        step_outputs.insert("parse".to_string(), parse_out);
+
+        // This is the dtolnay/rust-toolchain pattern that triggered the original bug
+        let text = "rustup toolchain install nightly${{ steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || '' }}";
+        let result = preprocess_expressions(text, dir.path(), &None, &step_outputs, &env).unwrap();
+        assert_eq!(result, "rustup toolchain install nightly --allow-downgrade");
+    }
+
+    #[test]
+    fn preprocess_expressions_evaluates_comparison_to_empty() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("INPUT_COMPONENTS".to_string(), "rustfmt".to_string());
+
+        let mut step_outputs = HashMap::new();
+        let mut parse_out = HashMap::new();
+        parse_out.insert("toolchain".to_string(), "stable".to_string());
+        step_outputs.insert("parse".to_string(), parse_out);
+
+        let text = "rustup toolchain install stable${{ steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || '' }}";
+        let result = preprocess_expressions(text, dir.path(), &None, &step_outputs, &env).unwrap();
+        // stable != nightly, so the expression evaluates to ''
+        assert_eq!(result, "rustup toolchain install stable");
+    }
+
+    #[test]
+    fn preprocess_expressions_no_spaces() {
+        let dir = tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+
+        // dtolnay/rust-toolchain uses ${{runner.os}} without spaces
+        let text = "if [[ ${{runner.os}} == macOS ]]; then echo mac; fi";
+        let result =
+            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        assert_eq!(result, "if [[ Linux == macOS ]]; then echo mac; fi");
     }
 }
