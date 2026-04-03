@@ -1,8 +1,8 @@
 // App state for the UI
 use crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry};
 use crate::models::{
-    ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StepExecution, Workflow,
-    WorkflowExecution, WorkflowStatus,
+    ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
+    StepExecution, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use chrono::Local;
 use crossterm::event::KeyCode;
@@ -24,17 +24,19 @@ pub struct App {
     pub show_action_messages: bool,
     pub execution_queue: Vec<QueuedExecution>, // Workflows queued for execution
     pub current_execution: Option<usize>,
-    pub logs: Vec<String>,                    // Overall execution logs
-    pub log_scroll: usize,                    // Scrolling position for logs
-    pub job_list_state: ListState,            // For viewing job details
-    pub detailed_view: bool,                  // Whether we're in detailed view mode
-    pub step_list_state: ListState,           // For selecting steps in detailed view
-    pub step_table_state: TableState,         // For the steps table in detailed view
-    pub last_tick: Instant,                   // For UI animations and updates
-    pub tick_rate: Duration,                  // How often to update the UI
-    pub tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
-    pub status_message: Option<String>,       // Temporary status message to display
-    pub status_message_time: Option<Instant>, // When the message was set
+    pub logs: Vec<String>,                       // Overall execution logs
+    pub log_scroll: usize,                       // Scrolling position for logs
+    pub job_list_state: ListState,               // For viewing job details
+    pub detailed_view: bool,                     // Whether we're in detailed view mode
+    pub step_list_state: ListState,              // For selecting steps in detailed view
+    pub step_table_state: TableState,            // For the steps table in detailed view
+    pub last_tick: Instant,                      // For UI animations and updates
+    pub tick_rate: Duration,                     // How often to update the UI
+    pub spinner_frame: usize,                    // Current spinner animation frame
+    pub tx: mpsc::Sender<ExecutionResultMsg>,    // Channel for async communication
+    pub status_message: Option<String>,          // Temporary status message to display
+    pub status_message_severity: StatusSeverity, // Severity of the current status message
+    pub status_message_time: Option<Instant>,    // When the message was set
 
     // Search and filter functionality
     pub log_search_query: String, // Current search query for logs
@@ -56,6 +58,10 @@ pub struct App {
     pub job_selection_mode: bool, // Are we viewing jobs of a workflow?
     pub available_jobs: Vec<String>, // Job names from selected workflow
     pub selected_job_index: usize, // Cursor in job selection list
+
+    // Cached container runtime availability (avoids re-checking every render frame)
+    pub runtime_available: bool,
+    pub last_availability_check: Instant,
 }
 
 impl App {
@@ -188,6 +194,9 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
         };
 
+        // If we're still Docker/Podman after the availability check above, it was available
+        let runtime_available = matches!(runtime_type, RuntimeType::Docker | RuntimeType::Podman);
+
         App {
             workflows: Vec::new(),
             workflow_list_state,
@@ -208,8 +217,10 @@ impl App {
             step_table_state,
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(250), // Update 4 times per second
+            spinner_frame: 0,
             tx,
             status_message: None,
+            status_message_severity: StatusSeverity::default(),
             status_message_time: None,
 
             // Search and filter functionality
@@ -230,6 +241,9 @@ impl App {
             job_selection_mode: false,
             available_jobs: Vec::new(),
             selected_job_index: 0,
+
+            runtime_available,
+            last_availability_check: Instant::now(),
         }
     }
 
@@ -249,6 +263,13 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::Emulation,
             RuntimeType::Emulation => RuntimeType::Docker,
         };
+        // Re-check availability for the new runtime immediately
+        self.runtime_available = match self.runtime_type {
+            RuntimeType::Docker => wrkflw_executor::docker::is_available(),
+            RuntimeType::Podman => wrkflw_executor::podman::is_available(),
+            _ => false,
+        };
+        self.last_availability_check = Instant::now();
         self.logs
             .push(format!("Switched to {} mode", self.runtime_type_name()));
     }
@@ -825,7 +846,7 @@ impl App {
                 self.log_scroll = idx;
 
                 if !self.log_search_query.is_empty() {
-                    self.set_status_message(format!(
+                    self.set_success_message(format!(
                         "Found {} matches for '{}'",
                         self.log_search_matches.len(),
                         self.log_search_query
@@ -834,7 +855,7 @@ impl App {
             }
         } else if !self.log_search_query.is_empty() {
             // No matches found
-            self.set_status_message(format!("No matches found for '{}'", self.log_search_query));
+            self.set_warning_message(format!("No matches found for '{}'", self.log_search_query));
         }
     }
 
@@ -847,7 +868,7 @@ impl App {
                 self.log_scroll = idx;
 
                 // Set status message showing which match we're on
-                self.set_status_message(format!(
+                self.set_success_message(format!(
                     "Search match {}/{} for '{}'",
                     self.log_search_match_idx + 1,
                     self.log_search_matches.len(),
@@ -869,7 +890,7 @@ impl App {
                 self.log_scroll = idx;
 
                 // Set status message showing which match we're on
-                self.set_status_message(format!(
+                self.set_success_message(format!(
                     "Search match {}/{} for '{}'",
                     self.log_search_match_idx + 1,
                     self.log_search_matches.len(),
@@ -917,9 +938,31 @@ impl App {
         }
     }
 
-    // Set a temporary status message to be displayed in the UI
-    pub fn set_status_message(&mut self, message: String) {
+    // Set a temporary error status message to be displayed in the UI
+    pub fn set_error_message(&mut self, message: String) {
         self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Error;
+        self.status_message_time = Some(Instant::now());
+    }
+
+    // Set a temporary warning status message
+    pub fn set_warning_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Warning;
+        self.status_message_time = Some(Instant::now());
+    }
+
+    // Set a temporary info status message
+    pub fn set_info_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Info;
+        self.status_message_time = Some(Instant::now());
+    }
+
+    // Set a temporary success status message
+    pub fn set_success_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Success;
         self.status_message_time = Some(Instant::now());
     }
 
@@ -937,6 +980,18 @@ impl App {
 
         if now.duration_since(self.last_tick) >= self.tick_rate {
             self.last_tick = now;
+            self.spinner_frame = (self.spinner_frame + 1) % crate::theme::symbols::SPINNER.len();
+
+            // Refresh container runtime availability every 30 seconds
+            if now.duration_since(self.last_availability_check) >= Duration::from_secs(30) {
+                self.last_availability_check = now;
+                self.runtime_available = match self.runtime_type {
+                    RuntimeType::Docker => wrkflw_executor::docker::is_available(),
+                    RuntimeType::Podman => wrkflw_executor::podman::is_available(),
+                    _ => false,
+                };
+            }
+
             true
         } else {
             false
@@ -1066,7 +1121,7 @@ impl App {
                 ));
 
                 // Set a success status message
-                self.set_status_message(format!("✅ Workflow '{}' has been reset!", workflow_name));
+                self.set_success_message(format!("Workflow '{}' has been reset!", workflow_name));
             }
         }
     }

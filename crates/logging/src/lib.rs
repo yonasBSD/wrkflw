@@ -1,3 +1,5 @@
+pub mod symbols;
+
 use chrono::Local;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
@@ -7,6 +9,10 @@ static LOGS: Lazy<Arc<Mutex<Vec<String>>>> = Lazy::new(|| Arc::new(Mutex::new(Ve
 
 // Current log level
 static LOG_LEVEL: Lazy<Arc<Mutex<LogLevel>>> = Lazy::new(|| Arc::new(Mutex::new(LogLevel::Info)));
+
+// When true, log() stores messages but does not print to stdout/stderr.
+// Enable this while a TUI owns the terminal to prevent display corruption.
+static QUIET_MODE: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
 
 // Log levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,10 +26,10 @@ pub enum LogLevel {
 impl LogLevel {
     fn prefix(&self) -> &'static str {
         match self {
-            LogLevel::Debug => "🔍",
-            LogLevel::Info => "ℹ️",
-            LogLevel::Warning => "⚠️",
-            LogLevel::Error => "❌",
+            LogLevel::Debug => symbols::DEBUG,
+            LogLevel::Info => symbols::INFO,
+            LogLevel::Warning => symbols::WARNING,
+            LogLevel::Error => symbols::FAILURE,
         }
     }
 }
@@ -32,6 +38,15 @@ impl LogLevel {
 pub fn set_log_level(level: LogLevel) {
     if let Ok(mut current_level) = LOG_LEVEL.lock() {
         *current_level = level;
+    }
+}
+
+/// Suppress console output (stdout/stderr) from log calls.
+/// Messages are still stored and available via `get_logs()`.
+/// Call with `true` before entering TUI mode, `false` after leaving.
+pub fn set_quiet_mode(quiet: bool) {
+    if let Ok(mut q) = QUIET_MODE.lock() {
+        *q = quiet;
     }
 }
 
@@ -56,14 +71,15 @@ pub fn log(level: LogLevel, message: &str) {
         logs.push(formatted.clone());
     }
 
-    // Print to console if the message level is >= the current log level
-    // This ensures Debug messages only show up when the Debug level is set
-    if let Ok(current_level) = LOG_LEVEL.lock() {
-        if level >= *current_level {
-            // Print to stdout/stderr based on level
-            match level {
-                LogLevel::Error | LogLevel::Warning => eprintln!("{}", formatted),
-                _ => println!("{}", formatted),
+    // Print to console unless quiet mode is active (TUI owns the terminal)
+    let is_quiet = QUIET_MODE.lock().map(|q| *q).unwrap_or(false);
+    if !is_quiet {
+        if let Ok(current_level) = LOG_LEVEL.lock() {
+            if level >= *current_level {
+                match level {
+                    LogLevel::Error | LogLevel::Warning => eprintln!("{}", formatted),
+                    _ => println!("{}", formatted),
+                }
             }
         }
     }
@@ -76,7 +92,11 @@ pub fn get_logs() -> Vec<String> {
     } else {
         // If we can't access logs, return an error message with timestamp
         let timestamp = Local::now().format("%H:%M:%S").to_string();
-        vec![format!("[{}] ❌ Error accessing logs", timestamp)]
+        vec![format!(
+            "[{}] {} Error accessing logs",
+            timestamp,
+            symbols::FAILURE
+        )]
     }
 }
 

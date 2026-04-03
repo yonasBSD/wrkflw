@@ -36,6 +36,9 @@ pub async fn run_wrkflw_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Suppress logging to stdout/stderr while TUI owns the terminal
+    wrkflw_logging::set_quiet_mode(true);
+
     // Set up channel for async communication
     let (tx, rx): (
         mpsc::Sender<ExecutionResultMsg>,
@@ -104,6 +107,7 @@ pub async fn run_wrkflw_tui(
     let result = run_tui_event_loop(&mut terminal, &mut app, &tx_clone, &rx, verbose);
 
     // Clean up terminal
+    wrkflw_logging::set_quiet_mode(false);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -463,7 +467,7 @@ fn run_tui_event_loop(
                                             || workflow.status == WorkflowStatus::Skipped;
 
                                         // Now set the status message (mutable borrow)
-                                        app.set_status_message(format!(
+                                        app.set_error_message(format!(
                                             "Cannot trigger workflow '{}' in {} state. Press Shift+R to reset.",
                                             workflow_name,
                                             status_text

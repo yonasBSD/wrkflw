@@ -2,6 +2,7 @@
 use chrono::Local;
 use std::path::PathBuf;
 use wrkflw_executor::{JobStatus, StepStatus};
+use wrkflw_logging::symbols;
 
 /// Type alias for the complex execution result type
 pub type ExecutionResultMsg = (usize, Result<(Vec<wrkflw_executor::JobResult>, ()), String>);
@@ -56,6 +57,16 @@ pub struct StepExecution {
     pub output: String,
 }
 
+/// Severity level for status bar toast messages
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum StatusSeverity {
+    Success,
+    Info,
+    Warning,
+    #[default]
+    Error,
+}
+
 /// Log filter levels
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogFilterLevel {
@@ -71,11 +82,13 @@ impl LogFilterLevel {
     pub fn matches(&self, log: &str) -> bool {
         match self {
             LogFilterLevel::Info => {
-                log.contains("ℹ️") || (log.contains("INFO") && !log.contains("SUCCESS"))
+                log.contains(symbols::INFO) || (log.contains("INFO") && !log.contains("SUCCESS"))
             }
-            LogFilterLevel::Warning => log.contains("⚠️") || log.contains("WARN"),
-            LogFilterLevel::Error => log.contains("❌") || log.contains("ERROR"),
-            LogFilterLevel::Success => log.contains("SUCCESS") || log.contains("success"),
+            LogFilterLevel::Warning => log.contains(symbols::WARNING) || log.contains("WARN"),
+            LogFilterLevel::Error => log.contains(symbols::FAILURE) || log.contains("ERROR"),
+            LogFilterLevel::Success => {
+                log.contains(symbols::SUCCESS) || log.contains("SUCCESS") || log.contains("success")
+            }
             LogFilterLevel::Trigger => {
                 log.contains("Triggering") || log.contains("triggered") || log.contains("TRIG")
             }
