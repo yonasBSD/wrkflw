@@ -4638,6 +4638,15 @@ async fn execute_composite_action(
 
                 // Short-circuit on failure if needed
                 if step_result.status == StepStatus::Failure {
+                    // Still propagate whatever outputs were collected before the failure
+                    propagate_composite_outputs(
+                        &action_def,
+                        &composite_step_outputs,
+                        &action_env,
+                        job_env,
+                        working_dir,
+                        &composite_job_status,
+                    );
                     return Ok(StepResult::new(
                         step.name
                             .clone()
@@ -4647,6 +4656,16 @@ async fn execute_composite_action(
                     ));
                 }
             }
+
+            // Propagate composite action outputs to the caller's GITHUB_OUTPUT
+            propagate_composite_outputs(
+                &action_def,
+                &composite_step_outputs,
+                &action_env,
+                job_env,
+                working_dir,
+                &composite_job_status,
+            );
 
             // All steps completed successfully
             let output = if verbose {
@@ -4698,6 +4717,123 @@ async fn execute_composite_action(
             "Action is not a composite action or has invalid format".to_string(),
         )),
     }
+}
+
+/// Evaluate a composite action's `outputs:` section and write the resolved values
+/// to the caller's GITHUB_OUTPUT file so `${{ steps.<id>.outputs.<key> }}` works.
+fn propagate_composite_outputs(
+    action_def: &serde_yaml::Value,
+    composite_step_outputs: &HashMap<String, HashMap<String, String>>,
+    action_env: &HashMap<String, String>,
+    caller_job_env: &HashMap<String, String>,
+    working_dir: &Path,
+    job_status: &str,
+) {
+    let outputs = match action_def.get("outputs").and_then(|v| v.as_mapping()) {
+        Some(m) => m,
+        None => return, // No outputs declared
+    };
+
+    // Build an expression context scoped to the composite's internal steps
+    let empty_matrix = None;
+    let empty_statuses = HashMap::new();
+    let empty_secrets = HashMap::new();
+    let empty_needs = HashMap::new();
+    let empty_results = HashMap::new();
+    let expr_ctx = crate::expression::ExpressionContext {
+        env_context: action_env,
+        step_outputs: composite_step_outputs,
+        matrix_combination: &empty_matrix,
+        step_statuses: &empty_statuses,
+        job_status,
+        secrets_context: &empty_secrets,
+        needs_context: &empty_needs,
+        needs_results: &empty_results,
+    };
+
+    // Collect evaluated outputs
+    let mut resolved: Vec<(String, String)> = Vec::new();
+    for (key, def) in outputs {
+        let key_str = match key.as_str() {
+            Some(k) => k,
+            None => continue,
+        };
+        let value_expr = match def.get("value").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        match crate::substitution::preprocess_expressions(value_expr, working_dir, &expr_ctx) {
+            Ok(val) => resolved.push((key_str.to_string(), val)),
+            Err(e) => {
+                wrkflw_logging::debug(&format!(
+                    "Failed to evaluate composite output '{}': {}",
+                    key_str, e
+                ));
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return;
+    }
+
+    // Append to the caller's GITHUB_OUTPUT file
+    if let Some(output_path) = caller_job_env.get("GITHUB_OUTPUT") {
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_path)
+        {
+            Ok(mut f) => {
+                for (key, value) in &resolved {
+                    let res = if value.contains('\n') {
+                        // Use a unique delimiter to avoid collisions with value content
+                        let delim = generate_heredoc_delimiter(value);
+                        writeln!(f, "{}<<{}", key, delim)
+                            .and_then(|_| write!(f, "{}", value))
+                            .and_then(|_| {
+                                if !value.ends_with('\n') {
+                                    writeln!(f)
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .and_then(|_| writeln!(f, "{}", delim))
+                    } else {
+                        writeln!(f, "{}={}", key, value)
+                    };
+                    if let Err(e) = res {
+                        wrkflw_logging::debug(&format!(
+                            "Failed to write composite output '{}' to GITHUB_OUTPUT: {}",
+                            key, e
+                        ));
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                wrkflw_logging::debug(&format!(
+                    "Failed to open GITHUB_OUTPUT for composite output propagation: {}",
+                    e
+                ));
+            }
+        }
+    }
+}
+
+/// Generate a heredoc delimiter that does not appear as a standalone line in `value`.
+/// Starts with `ghadelimiter_` and appends a numeric suffix until unique.
+fn generate_heredoc_delimiter(value: &str) -> String {
+    let base = "ghadelimiter";
+    let mut candidate = base.to_string();
+    let mut counter: u64 = 0;
+    // Check if the candidate appears as a complete line in the value
+    while value.lines().any(|line| line == candidate) {
+        counter += 1;
+        candidate = format!("{}_{}", base, counter);
+    }
+    candidate
 }
 
 // Helper function to convert YAML step to our Step struct
@@ -8462,5 +8598,344 @@ runs:
         // Without a step_id, ::set-output:: commands should be silently ignored
         process_workflow_commands("::set-output name=x::val\n", None, &mut outputs, None);
         assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn propagate_composite_outputs_writes_to_github_output_file() {
+        // Simulate a composite action with an outputs section that references
+        // an internal step output via ${{ steps.build-msg.outputs.msg }}
+        let action_yaml = r#"
+name: Greet
+outputs:
+  message:
+    description: The greeting
+    value: ${{ steps.build-msg.outputs.msg }}
+  static_val:
+    description: A literal
+    value: hello-literal
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        // Populate the composite's internal step outputs
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut build_msg_outputs = HashMap::new();
+        build_msg_outputs.insert("msg".to_string(), "Hi, World!".to_string());
+        composite_step_outputs.insert("build-msg".to_string(), build_msg_outputs);
+
+        let action_env = HashMap::new();
+
+        // Create a temp file to act as the caller's GITHUB_OUTPUT
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        // Read the GITHUB_OUTPUT file — it should contain the evaluated outputs
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        assert!(
+            content.contains("message=Hi, World!"),
+            "Expected 'message=Hi, World!' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+        assert!(
+            content.contains("static_val=hello-literal"),
+            "Expected 'static_val=hello-literal' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_no_outputs_section_is_noop() {
+        let action_yaml = r#"
+name: NoOutputs
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+        let composite_step_outputs = HashMap::new();
+        let action_env = HashMap::new();
+
+        // No GITHUB_OUTPUT in env — should not panic
+        let caller_env = HashMap::new();
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+        // No assertion needed — just verifying it doesn't panic
+    }
+
+    #[test]
+    fn propagate_composite_outputs_on_failure_writes_partial_outputs() {
+        // Simulate a composite action where one step succeeded before a later step failed.
+        // The output referencing the successful step should still be propagated.
+        let action_yaml = r#"
+name: PartialOutputs
+outputs:
+  greeting:
+    description: From step that succeeded
+    value: ${{ steps.ok-step.outputs.val }}
+  missing:
+    description: From step that never ran
+    value: ${{ steps.never-ran.outputs.val }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        // Only the first step produced outputs
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut ok_outputs = HashMap::new();
+        ok_outputs.insert("val".to_string(), "partial-result".to_string());
+        composite_step_outputs.insert("ok-step".to_string(), ok_outputs);
+        // "never-ran" is intentionally absent
+
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "failure",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        assert!(
+            content.contains("greeting=partial-result"),
+            "Expected 'greeting=partial-result' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+        // The missing step output should resolve to empty string, not panic
+        assert!(
+            content.contains("missing="),
+            "Expected 'missing=' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_nonexistent_step_resolves_empty() {
+        // When an output value references a step that doesn't exist in the
+        // composite_step_outputs map, it should resolve to an empty string
+        // rather than panicking or erroring.
+        let action_yaml = r#"
+name: GhostStep
+outputs:
+  phantom:
+    description: References a step that was never executed
+    value: ${{ steps.ghost.outputs.result }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        let composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        // Should write the key with an empty value, not skip or panic
+        assert!(
+            content.contains("phantom="),
+            "Expected 'phantom=' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_multiline_value_uses_heredoc() {
+        // When an output value contains newlines, it must be written using
+        // the heredoc format (key<<DELIM\nvalue\nDELIM) so that
+        // parse_github_kv_file can read it back correctly.
+        let action_yaml = r#"
+name: MultiLine
+outputs:
+  body:
+    description: A multiline value
+    value: ${{ steps.gen.outputs.text }}
+  single:
+    description: A single-line value
+    value: ${{ steps.gen.outputs.title }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut gen_outputs = HashMap::new();
+        gen_outputs.insert("text".to_string(), "line1\nline2\nline3".to_string());
+        gen_outputs.insert("title".to_string(), "hello".to_string());
+        composite_step_outputs.insert("gen".to_string(), gen_outputs);
+
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+
+        // Multiline value should use heredoc format with ghadelimiter prefix
+        assert!(
+            content.contains("body<<ghadelimiter"),
+            "Expected heredoc format with ghadelimiter for multiline value in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+
+        // Single-line value should use simple key=value format
+        assert!(
+            content.contains("single=hello"),
+            "Expected 'single=hello' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+
+        // Verify parse_github_kv_file can round-trip the multiline value
+        let parsed = crate::github_env_files::parse_github_kv_file(&content);
+        assert_eq!(
+            parsed.get("body").map(|s| s.as_str()),
+            Some("line1\nline2\nline3"),
+            "parse_github_kv_file should round-trip the multiline value"
+        );
+        assert_eq!(
+            parsed.get("single").map(|s| s.as_str()),
+            Some("hello"),
+            "parse_github_kv_file should round-trip the single-line value"
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_value_containing_eof_uses_unique_delimiter() {
+        // When a multiline output value contains a line that is literally "ghadelimiter",
+        // the function must pick a different delimiter to avoid premature termination.
+        let action_yaml = r#"
+name: EOFInValue
+outputs:
+  data:
+    description: Value with EOF-like content
+    value: ${{ steps.gen.outputs.blob }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut gen_outputs = HashMap::new();
+        // Value that contains "ghadelimiter" as a standalone line
+        gen_outputs.insert(
+            "blob".to_string(),
+            "before\nghadelimiter\nafter".to_string(),
+        );
+        composite_step_outputs.insert("gen".to_string(), gen_outputs);
+
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+
+        // The delimiter must NOT be "ghadelimiter" since the value contains it
+        assert!(
+            !content.starts_with("data<<ghadelimiter\n")
+                || content.starts_with("data<<ghadelimiter_"),
+            "Delimiter should have been suffixed to avoid collision, got: {:?}",
+            content
+        );
+
+        // Verify parse_github_kv_file can round-trip the value correctly
+        let parsed = crate::github_env_files::parse_github_kv_file(&content);
+        assert_eq!(
+            parsed.get("data").map(|s| s.as_str()),
+            Some("before\nghadelimiter\nafter"),
+            "parse_github_kv_file should round-trip value containing the base delimiter"
+        );
+    }
+
+    #[test]
+    fn generate_heredoc_delimiter_avoids_collisions() {
+        // Base case: no collision
+        let delim = generate_heredoc_delimiter("hello\nworld");
+        assert_eq!(delim, "ghadelimiter");
+
+        // Value contains the base delimiter as a line
+        let delim = generate_heredoc_delimiter("line1\nghadelimiter\nline2");
+        assert_eq!(delim, "ghadelimiter_1");
+
+        // Value contains both base and _1
+        let delim = generate_heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
+        assert_eq!(delim, "ghadelimiter_2");
     }
 }
