@@ -1,13 +1,18 @@
 use regex::Regex;
 use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tempfile::TempDir;
 use wrkflw_logging;
 
-/// Configuration for sandbox execution
+/// Configuration for sandbox execution.
+///
+/// Note: this sandbox provides **command-level** validation (whitelist,
+/// blocklist, dangerous-pattern regexes) and **environment-variable**
+/// filtering. It does NOT provide filesystem isolation — the command runs
+/// in the caller's working directory as a plain subprocess, so absolute
+/// paths and `..` sequences can reach anything the host user can reach.
+/// If filesystem isolation is needed, use the Docker or Podman runtime.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     /// Maximum execution time for commands
@@ -20,10 +25,6 @@ pub struct SandboxConfig {
     pub allowed_commands: HashSet<String>,
     /// Blocked commands (blacklist)
     pub blocked_commands: HashSet<String>,
-    /// Allowed file system paths (read-only)
-    pub allowed_read_paths: HashSet<PathBuf>,
-    /// Allowed file system paths (read-write)
-    pub allowed_write_paths: HashSet<PathBuf>,
     /// Whether to enable network access
     pub allow_network: bool,
     /// Maximum number of processes
@@ -143,8 +144,6 @@ impl Default for SandboxConfig {
             max_cpu_percent: 80,
             allowed_commands,
             blocked_commands,
-            allowed_read_paths: HashSet::new(),
-            allowed_write_paths: HashSet::new(),
             allow_network: false,
             max_processes: 10,
             strict_mode: true,
@@ -180,32 +179,35 @@ pub enum SandboxError {
 /// Secure sandbox for executing commands in emulation mode
 pub struct Sandbox {
     config: SandboxConfig,
-    workspace: TempDir,
     dangerous_patterns: Vec<Regex>,
 }
 
 impl Sandbox {
     /// Create a new sandbox with the given configuration
     pub fn new(config: SandboxConfig) -> Result<Self, SandboxError> {
-        let workspace = tempfile::tempdir().map_err(|e| SandboxError::SandboxSetupError {
-            reason: format!("Failed to create sandbox workspace: {}", e),
-        })?;
-
         let dangerous_patterns = Self::compile_dangerous_patterns();
 
-        wrkflw_logging::info(&format!(
-            "Created new sandbox with workspace: {}",
-            workspace.path().display()
-        ));
+        wrkflw_logging::info("Created new sandbox");
 
         Ok(Self {
             config,
-            workspace,
             dangerous_patterns,
         })
     }
 
-    /// Execute a command in the sandbox
+    /// Execute a command in the sandbox.
+    ///
+    /// The command runs **in-place** in `working_dir` (no file copying). The
+    /// caller is responsible for ensuring `working_dir` is the correct host
+    /// workspace — `SecureEmulationRuntime::run_container` rebases container
+    /// paths via the volume mount before calling in, matching the mount
+    /// semantics of docker/podman (#88).
+    ///
+    /// Security is enforced by `validate_command` (command whitelist / blocked
+    /// commands / dangerous patterns), `is_env_var_safe` (env var filtering),
+    /// and `execute_with_limits` (timeout). The previous copy-files-to-a-
+    /// private-workspace layer was not actually providing isolation — it was
+    /// breaking the run-step / artifact-handler workspace invariant.
     pub async fn execute_command(
         &self,
         command: &[&str],
@@ -223,11 +225,8 @@ impl Sandbox {
         // Step 1: Validate command
         self.validate_command(&command_str)?;
 
-        // Step 2: Setup sandbox environment
-        let sandbox_dir = self.setup_sandbox_environment(working_dir)?;
-
-        // Step 3: Execute with limits
-        self.execute_with_limits(command, env_vars, &sandbox_dir)
+        // Step 2: Execute in-place with limits
+        self.execute_with_limits(command, env_vars, working_dir)
             .await
     }
 
@@ -333,63 +332,6 @@ impl Sandbox {
         builtins.contains(&command)
     }
 
-    /// Setup isolated sandbox environment
-    fn setup_sandbox_environment(&self, working_dir: &Path) -> Result<PathBuf, SandboxError> {
-        let sandbox_root = self.workspace.path();
-        let sandbox_workspace = sandbox_root.join("workspace");
-
-        // Create sandbox directory structure
-        fs::create_dir_all(&sandbox_workspace).map_err(|e| SandboxError::SandboxSetupError {
-            reason: format!("Failed to create sandbox workspace: {}", e),
-        })?;
-
-        // Copy allowed files to sandbox (if working_dir exists and is allowed)
-        if working_dir.exists() && self.is_path_allowed(working_dir, false) {
-            self.copy_safe_files(working_dir, &sandbox_workspace)?;
-        }
-
-        wrkflw_logging::info(&format!(
-            "Sandbox environment ready: {}",
-            sandbox_workspace.display()
-        ));
-
-        Ok(sandbox_workspace)
-    }
-
-    /// Copy files safely to sandbox, excluding dangerous files
-    fn copy_safe_files(&self, source: &Path, dest: &Path) -> Result<(), SandboxError> {
-        for entry in fs::read_dir(source).map_err(|e| SandboxError::SandboxSetupError {
-            reason: format!("Failed to read source directory: {}", e),
-        })? {
-            let entry = entry.map_err(|e| SandboxError::SandboxSetupError {
-                reason: format!("Failed to read directory entry: {}", e),
-            })?;
-
-            let path = entry.path();
-            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-
-            // Skip dangerous or sensitive files
-            if self.should_skip_file(file_name) {
-                continue;
-            }
-
-            let dest_path = dest.join(file_name);
-
-            if path.is_file() {
-                fs::copy(&path, &dest_path).map_err(|e| SandboxError::SandboxSetupError {
-                    reason: format!("Failed to copy file: {}", e),
-                })?;
-            } else if path.is_dir() && !self.should_skip_directory(file_name) {
-                fs::create_dir_all(&dest_path).map_err(|e| SandboxError::SandboxSetupError {
-                    reason: format!("Failed to create directory: {}", e),
-                })?;
-                self.copy_safe_files(&path, &dest_path)?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Execute command with resource limits and monitoring
     async fn execute_with_limits(
         &self,
@@ -466,28 +408,6 @@ impl Sandbox {
         }
     }
 
-    /// Check if a path is allowed for access
-    fn is_path_allowed(&self, path: &Path, write_access: bool) -> bool {
-        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-
-        if write_access {
-            self.config
-                .allowed_write_paths
-                .iter()
-                .any(|allowed| abs_path.starts_with(allowed))
-        } else {
-            self.config
-                .allowed_read_paths
-                .iter()
-                .any(|allowed| abs_path.starts_with(allowed))
-                || self
-                    .config
-                    .allowed_write_paths
-                    .iter()
-                    .any(|allowed| abs_path.starts_with(allowed))
-        }
-    }
-
     /// Check if an environment variable is safe to pass through
     fn is_env_var_safe(&self, key: &str) -> bool {
         // Block dangerous environment variables
@@ -502,45 +422,6 @@ impl Sandbox {
         ];
 
         !dangerous_env_vars.contains(&key)
-    }
-
-    /// Check if a file should be skipped during copying
-    fn should_skip_file(&self, filename: &str) -> bool {
-        let dangerous_files = [
-            ".ssh",
-            ".gnupg",
-            ".aws",
-            ".docker",
-            "id_rsa",
-            "id_ed25519",
-            "credentials",
-            "config",
-            ".env",
-            ".secrets",
-        ];
-
-        dangerous_files
-            .iter()
-            .any(|pattern| filename.contains(pattern))
-            || filename.starts_with('.') && filename != ".gitignore" && filename != ".github"
-    }
-
-    /// Check if a directory should be skipped
-    fn should_skip_directory(&self, dirname: &str) -> bool {
-        let skip_dirs = [
-            "target",
-            "node_modules",
-            ".git",
-            ".cargo",
-            ".npm",
-            ".cache",
-            "build",
-            "dist",
-            "tmp",
-            "temp",
-        ];
-
-        skip_dirs.contains(&dirname)
     }
 
     /// Compile regex patterns for dangerous command detection
@@ -586,32 +467,18 @@ impl Sandbox {
 
 /// Create a default sandbox configuration for CI/CD workflows
 pub fn create_workflow_sandbox_config() -> SandboxConfig {
-    let mut allowed_read_paths = HashSet::new();
-    allowed_read_paths.insert(PathBuf::from("."));
-
-    let mut allowed_write_paths = HashSet::new();
-    allowed_write_paths.insert(PathBuf::from("."));
-
     SandboxConfig {
         max_execution_time: Duration::from_secs(1800), // 30 minutes
         max_memory_mb: 2048,                           // 2GB
         max_processes: 50,
         allow_network: true,
         strict_mode: false,
-        allowed_read_paths,
-        allowed_write_paths,
         ..Default::default()
     }
 }
 
 /// Create a strict sandbox configuration for untrusted code
 pub fn create_strict_sandbox_config() -> SandboxConfig {
-    let mut allowed_read_paths = HashSet::new();
-    allowed_read_paths.insert(PathBuf::from("."));
-
-    let mut allowed_write_paths = HashSet::new();
-    allowed_write_paths.insert(PathBuf::from("."));
-
     // Very limited command set
     let allowed_commands = ["echo", "cat", "ls", "pwd", "date"]
         .iter()
@@ -624,8 +491,6 @@ pub fn create_strict_sandbox_config() -> SandboxConfig {
         max_processes: 5,
         allow_network: false,
         strict_mode: true,
-        allowed_read_paths,
-        allowed_write_paths,
         allowed_commands,
         ..Default::default()
     }
@@ -665,20 +530,5 @@ mod tests {
         // Should block non-whitelisted commands
         assert!(sandbox.validate_command("git clone").is_err());
         assert!(sandbox.validate_command("cargo build").is_err());
-    }
-
-    #[test]
-    fn test_file_filtering() {
-        let sandbox = Sandbox::new(SandboxConfig::default()).unwrap();
-
-        // Should skip dangerous files
-        assert!(sandbox.should_skip_file("id_rsa"));
-        assert!(sandbox.should_skip_file(".ssh"));
-        assert!(sandbox.should_skip_file("credentials"));
-
-        // Should allow safe files
-        assert!(!sandbox.should_skip_file("Cargo.toml"));
-        assert!(!sandbox.should_skip_file("README.md"));
-        assert!(!sandbox.should_skip_file(".gitignore"));
     }
 }

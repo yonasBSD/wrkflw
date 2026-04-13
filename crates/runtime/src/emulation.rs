@@ -1,4 +1,6 @@
-use crate::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use crate::container::{
+    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime,
+};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -152,7 +154,7 @@ impl ContainerRuntime for EmulationRuntime {
         command: &[&str],
         env_vars: &[(&str, &str)],
         working_dir: &Path,
-        _volumes: &[(&Path, &Path)],
+        volumes: &[(&Path, &Path)],
         _entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Build command string
@@ -197,47 +199,13 @@ impl ContainerRuntime for EmulationRuntime {
             wrkflw_logging::info(&format!("  {}={}", key, value));
         }
 
-        // Find actual working directory - determine if we should use the current directory instead
-        let actual_working_dir: PathBuf = if !working_dir.exists() {
-            // Look for GITHUB_WORKSPACE or CI_PROJECT_DIR in env_vars
-            let mut workspace_path = None;
-            for (key, value) in env_vars {
-                if *key == "GITHUB_WORKSPACE" || *key == "CI_PROJECT_DIR" {
-                    workspace_path = Some(PathBuf::from(value));
-                    break;
-                }
-            }
-
-            // If found, use that as the working directory
-            if let Some(path) = workspace_path {
-                if path.exists() {
-                    wrkflw_logging::info(&format!(
-                        "Using environment-defined workspace: {}",
-                        path.display()
-                    ));
-                    path
-                } else {
-                    // Fallback to current directory
-                    let current_dir =
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    wrkflw_logging::info(&format!(
-                        "Using current directory: {}",
-                        current_dir.display()
-                    ));
-                    current_dir
-                }
-            } else {
-                // Fallback to current directory
-                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                wrkflw_logging::info(&format!(
-                    "Using current directory: {}",
-                    current_dir.display()
-                ));
-                current_dir
-            }
-        } else {
-            working_dir.to_path_buf()
-        };
+        // Resolve the host working directory via the shared mount-semantics
+        // helper. When `volumes` covers `working_dir` (the normal case for
+        // container-visible paths like `/github/workspace`), the rebase
+        // always wins over an accidentally-existing host path — so a dev
+        // environment with a real `/github/workspace` directory cannot
+        // silently reintroduce #88.
+        let actual_working_dir = rebase_working_dir_or_error(working_dir, volumes, "emulation")?;
 
         wrkflw_logging::info(&format!(
             "Using actual working directory: {}",
@@ -822,5 +790,39 @@ mod tests {
             "stderr should explain the action was not executed"
         );
         assert!(output.stdout.is_empty(), "stdout should be empty");
+    }
+
+    /// Regression for #88: if the caller passes a container-visible working
+    /// directory that no volume covers, emulation must hard-error instead of
+    /// silently rerouting to `GITHUB_WORKSPACE`. Symmetry test with the
+    /// matching `secure_emulation_errors_when_volumes_dont_cover_working_dir`.
+    #[tokio::test]
+    async fn emulation_errors_when_volumes_dont_cover_working_dir() {
+        let runtime = EmulationRuntime::new();
+
+        // /github/workspace doesn't exist on host and no volume covers it.
+        let result = runtime
+            .run_container(
+                "alpine:latest",
+                &["echo", "nope"],
+                &[],
+                Path::new("/github/workspace"),
+                &[],
+                None,
+            )
+            .await;
+
+        let err = result.expect_err("should error when no volume covers working_dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not covered by any volume mount"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("emulation:"),
+            "error should carry runtime label, got: {}",
+            msg
+        );
     }
 }
