@@ -148,6 +148,7 @@ pub async fn run_wrkflw_tui(
 }
 
 // Helper function to run the main event loop
+#[allow(clippy::collapsible_match)]
 fn run_tui_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
