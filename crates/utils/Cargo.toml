@@ -1,6 +1,6 @@
 [package]
 name = "wrkflw-utils"
-version = "0.7.3"
+version = "0.8.0"
 edition.workspace = true
 description = "Utility functions for wrkflw workflow execution engine"
 license.workspace = true

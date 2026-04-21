@@ -1,6 +1,6 @@
 [package]
 name = "wrkflw-executor"
-version = "0.7.3"
+version = "0.8.0"
 edition.workspace = true
 description = "Workflow execution engine for wrkflw"
 license.workspace = true

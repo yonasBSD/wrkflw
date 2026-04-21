@@ -1,8 +1,8 @@
 # Breaking Changes
 
-> The entries below ship in the next release (post-v0.7.3, currently unreleased on `main`).
+> The entries below shipped in v0.8.0.
 
-## `wrkflw run --event` requires change-set input by default (Unreleased)
+## `wrkflw run --event` requires change-set input by default (0.8.0)
 
 `wrkflw run` now supports trigger-aware filtering via `--event`, `--diff`,
 and `--changed-files`. When any of those flags is passed, the CLI runs a
@@ -101,7 +101,7 @@ Pick the option that matches your intent:
 
 ---
 
-## Shell now matches GitHub Actions invocation (Unreleased)
+## Shell now matches GitHub Actions invocation (0.8.0)
 
 The `bash` shell now executes with `bash --noprofile --norc -e -o pipefail -c`, matching GitHub Actions behavior. The `sh` shell uses `sh -e -c`. This means:
 
@@ -136,7 +136,7 @@ If a step intentionally tolerates command failures, either:
 
 ---
 
-## EncryptedSecretStore serialization format (Unreleased)
+## EncryptedSecretStore serialization format (0.8.0)
 
 The `EncryptedSecretStore` struct in `crates/secrets/src/storage.rs` has changed its serialization format:
 
