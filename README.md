@@ -28,6 +28,15 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Remote triggering** — trigger `workflow_dispatch` runs on GitHub or GitLab pipelines
 - **GitLab support** — validate and trigger GitLab CI pipelines
 
+## Not yet supported
+
+- GitHub encrypted secrets and fine-grained permissions
+- Event triggers other than `workflow_dispatch` for the remote `trigger` command
+- Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
+- `concurrency:` groups and `cancel-in-progress` — parsed but not enforced
+- Service containers — `services:` is parsed but never started, in any runtime
+- Windows and macOS runners — `runs-on: windows-*` / `macos-*` is silently mapped to a container image (macOS → a Linux image, Windows → a Windows container that won't run on Linux/macOS hosts). `${{ runner.os }}` reflects the host OS, not `runs-on`.
+
 ## Installation
 
 ```bash
@@ -224,7 +233,7 @@ jobs:
 - `with:` entries become `INPUT_<KEY>` env vars; `secrets:` become `SECRET_<KEY>`
 - Outputs from called jobs are merged back into `needs.<id>.outputs.*`
 
-**Limitations:** `secrets: inherit` is not supported; private repos for remote `uses:` are not yet supported; declared `on.workflow_call.outputs` is approximated by flattening all called-job outputs (the explicit mapping is not yet parsed).
+**Limitations:** private repos for remote `uses:` are not yet supported (the clone is unauthenticated); declared `on.workflow_call.outputs` is approximated by flattening all called-job outputs (the explicit mapping is not yet parsed).
 
 ## Secrets Management
 
@@ -240,31 +249,6 @@ wrkflw run .github/workflows/ci.yml
 ```
 
 Supported providers: environment variables, file-based, HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, Google Cloud Secret Manager. See the [secrets demo](examples/secrets-demo/) for detailed examples.
-
-## Limitations
-
-### Supported
-- Workflow syntax validation with exit codes
-- Job dependency resolution and parallel execution
-- Matrix builds, environment variables, GitHub context
-- `${{ ... }}` expression evaluation (`toJSON`, `fromJSON`, `contains`, `startsWith`, `success()`, `failure()`, etc.)
-- Container, JavaScript, composite, and local actions (with composite-action output propagation)
-- Reusable workflows (caller jobs) with output propagation into `needs.<id>.outputs.*`
-- `actions/upload-artifact`, `actions/download-artifact`, and `actions/cache` (local-only, scoped to the run / workspace)
-- Environment files (`GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY`)
-- Diff-aware trigger filtering (`--event`, `--diff`, `--changed-files`, `--base-branch`, `--activity-type`)
-- Watch mode with trigger-aware re-execution
-- TUI and CLI interfaces
-- Container cleanup (even on Ctrl+C)
-
-### Not Supported
-- GitHub encrypted secrets and fine-grained permissions
-- Event triggers other than `workflow_dispatch` for remote `trigger` command
-- `secrets: inherit` on reusable workflow calls
-- Private repos for remote `uses:` references
-- Windows and macOS runners
-- Job/step timeouts, concurrency, and cancellation
-- Service containers in emulation mode
 
 ## Project Structure
 
